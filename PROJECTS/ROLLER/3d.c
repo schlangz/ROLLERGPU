@@ -18,13 +18,19 @@
 #include "colision.h"
 #include "horizon.h"
 #include "building.h"
+#include "tower.h"
 #include "rollercomms.h"
 #include "crashdump.h"
 #include "snapshot.h"
 #include "snapshot_scenes.h"
 #include "rollerinput.h"
+#include "phone_ui.h"
 #include "touch_ui.h"
 #include "menu_render.h"
+#include "gpu_parity.h"
+#if defined(ROLLER_EDITOR_CORE)
+#include "editor_camera.h"
+#endif
 #include <SDL3/SDL.h>
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -92,6 +98,17 @@ static int iFrontendTimeTrialScreenActive = 0;
 static int iFrontendNetworkErrorHandled = 0;
 static int iFrontendRaceTrack = 0;
 static int iFrontendRaceFadeOutPending = 0;
+static const char *g_szDirectTrackPath = NULL;
+static const char *g_szDirectTrackAssetRoot = NULL;
+static const char *g_szDirectTrackFallbackRoot = NULL;
+static int g_bDirectTrackStateFixture = 0;
+#define DIRECT_TRACK_RELOAD_MAX_MALFORMED 8
+static const char *g_aszDirectTrackMalformed[
+  DIRECT_TRACK_RELOAD_MAX_MALFORMED];
+static int g_iDirectTrackMalformedCount = 0;
+static int g_iDirectTrackReloadCycles = 0;
+static uint32 g_uiDirectTrackSeedBeforeLoad = 0;
+static uint32 g_uiDirectTrackSeedAfterLoad = 0;
 
 //-------------------------------------------------------------------------------------------------
 //symbols defined by ROLLER
@@ -590,6 +607,13 @@ static void print_usage(FILE *f, const char *argv0)
   cli_fprintf(f, " --snapshot-scene NAME render a headless named scene snapshot\n");
   cli_fprintf(f, " --frames N[,M,...]     replay-frame indices to capture (--snapshot only)\n");
   cli_fprintf(f, " --out DIR              output directory for snapshot PNGs (--snapshot only)\n");
+  cli_fprintf(f, " --gpu-parity BACKEND   run F-S1 parity (vulkan, direct3d12, or metal)\n");
+  cli_fprintf(f, " --track-path PATH       load a track directly from an absolute path\n");
+  cli_fprintf(f, " --track-asset-root DIR  resolve direct-track assets from this document root first\n");
+  cli_fprintf(f, " --track-fallback-root DIR  override the direct-track FATDATA fallback root\n");
+  cli_fprintf(f, " --verify-track-state    seed populated community state and verify it is preserved\n");
+  cli_fprintf(f, " --track-reload-malformed PATH  add a rejected path to the direct-load soak\n");
+  cli_fprintf(f, " --track-reload-cycles N repeat valid/malformed/valid reload checks\n");
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1573,10 +1597,12 @@ static void race_handle_mouse_shortcuts(void)
   iWidth = winw > 0 ? winw : XMAX;
   iHeight = winh > 0 ? winh : YMAX;
   frontend_mouse_begin_frame(iWidth, iHeight);
-  touch_ui_register_buttons(iWidth, iHeight);
-  touch_ui_handle_buttons();
+  if (ROLLERPhoneUIActive()) {
+    touch_ui_register_buttons(iWidth, iHeight);
+    touch_ui_handle_buttons();
+  }
 
-  if (intro && replaytype == 2 && !game_req) {
+  if ((intro && replaytype == 2 && !game_req) || winner_mode) {
     if (frontend_mouse_consume_click_anywhere()) {
       race_drain_pending_key_input();
       racing = 0;
@@ -2192,6 +2218,9 @@ void fre(void **ppData)
 //00010AF0
 void doexit()
 {
+#if defined(ROLLER_EDITOR_CORE)
+  ErrorBoxExit("legacy code requested a process exit");
+#else
   frontend_shutdown_request();
 
   if (!frontend_shutdown_complete() &&
@@ -2205,6 +2234,7 @@ void doexit()
 #ifndef __EMSCRIPTEN__
   if (frontend_shutdown_complete())
     exit(0);
+#endif
 #endif
 }
 
@@ -2701,11 +2731,28 @@ void draw_road(uint8 *pScrPtr, int iCarIdx, unsigned int uiViewMode, int iCopyIm
   // Gameplay frame phase: camera/projection setup.
   screen_pointer = pScrPtr;                     // Set global screen buffer pointer for rendering functions
   game_render_set_target(g_pGameRenderer, pScrPtr, winw, winw, winh);
+#if defined(ROLLER_EDITOR_CORE)
+  if (!roller_ed_track_only_active() || !roller_ed_camera_apply()) {
+#endif
   calculateview(uiViewMode, iCarIdx, iChaseCamIdx); // Calculate camera view matrix and projection parameters
   noclip_camera_apply();
   chase_look_apply(); // Debug "Free Camera": hold RMB + move mouse to free-look, gated on the debug-overlay checkbox
+#if defined(ROLLER_EDITOR_CORE)
+    /* Non-track-only core callers retain the legacy setup, then accept the
+     * explicit facade override exactly as before E1-S6. */
+    roller_ed_camera_apply();
+  }
+#endif
   extern float viewx, viewy, viewz;
   extern int worlddirn, VIEWDIST;
+  unsigned int uiVisibilityViewMode = g_bNoclip ? 3u : uiViewMode;
+  int iRenderChunkIdx;
+#if defined(ROLLER_EDITOR_CORE)
+  if (roller_ed_track_only_active())
+    iRenderChunkIdx = CalcVisibleTrackEditor(uiVisibilityViewMode);
+  else
+#endif
+    iRenderChunkIdx = Car[iCarIdx].nCurrChunk;
   GameRenderCamera cam = {
       .viewX = viewx,
       .viewY = viewy,
@@ -2713,7 +2760,7 @@ void draw_road(uint8 *pScrPtr, int iCarIdx, unsigned int uiViewMode, int iCopyIm
       .cosYaw = SDL_cosf(ANGLE_TO_RADIANS(worlddirn)),
       .sinYaw = SDL_sinf(ANGLE_TO_RADIANS(worlddirn)),
       .fovScale = (float)VIEWDIST,
-      .renderChunkIdx = Car[iCarIdx].nCurrChunk,
+      .renderChunkIdx = iRenderChunkIdx,
   };
   game_render_set_camera(g_pGameRenderer, &cam);
 
@@ -2732,11 +2779,15 @@ void draw_road(uint8 *pScrPtr, int iCarIdx, unsigned int uiViewMode, int iCopyIm
   // Gameplay frame phase: atmosphere. Sky/horizon stays outside the depth-sorted 3D queue.
   game_render_draw_sky(g_pGameRenderer, &cam, &proj); // Draw sky/horizon background
 
-  unsigned int uiVisibilityViewMode = g_bNoclip ? 3u : uiViewMode;
-
   // Gameplay frame phase: visibility/entity production.
-  CalcVisibleTrack(iCarIdx, uiVisibilityViewMode); // Calculate which track segments are visible from current viewpoint
-  DrawCars(iCarIdx, uiVisibilityViewMode);         // Prepare visible cars (excluding current player if in chase cam)
+#if defined(ROLLER_EDITOR_CORE)
+  if (!roller_ed_track_only_active()) {
+#endif
+    CalcVisibleTrack(iCarIdx, uiVisibilityViewMode); // Calculate which track segments are visible from current viewpoint
+    DrawCars(iCarIdx, uiVisibilityViewMode);       // Prepare visible cars (excluding current player if in chase cam)
+#if defined(ROLLER_EDITOR_CORE)
+  }
+#endif
   CalcVisibleBuildings();                       // Calculate visibility and prepare building rendering data
 
   // Gameplay frame phase: 3D queue production and sorted dispatch.
@@ -2752,6 +2803,7 @@ void draw_road(uint8 *pScrPtr, int iCarIdx, unsigned int uiViewMode, int iCopyIm
 
 //-------------------------------------------------------------------------------------------------
 //00011930
+#if !defined(ROLLER_EDITOR_CORE)
 #if defined(IS_ANDROID)
 int main(int argc, const char **argv, const char **envp);
 int SDL_main(int argc, char *argv[])
@@ -2768,6 +2820,7 @@ int main(int argc, const char **argv, const char **envp)
   char whiplash_root[260] = { 0 };
   char szPlayer1NameOverride[ROLLER_PLAYER_NAME_BYTES] = { 0 };
   const char *midi_root = NULL;
+  const char *szGpuParityBackend = NULL;
 
   for (int i = 1; i < argc;) {
     int consumed = -1;
@@ -2893,6 +2946,75 @@ int main(int argc, const char **argv, const char **envp)
         cli_fprintf(stderr, "ERROR: '--out' needs an argument\n");
         return 1;
       }
+    } else if (strcmp(argv[i], "--gpu-parity") == 0) {
+      if (i + 1 < argc) {
+        szGpuParityBackend = argv[i + 1];
+        if (strcmp(szGpuParityBackend, "vulkan") != 0
+            && strcmp(szGpuParityBackend, "direct3d12") != 0
+            && strcmp(szGpuParityBackend, "metal") != 0) {
+          cli_fprintf(stderr, "ERROR: '--gpu-parity' expects vulkan, direct3d12, or metal\n");
+          return 1;
+        }
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr, "ERROR: '--gpu-parity' needs an argument\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--track-path") == 0) {
+      if (i + 1 < argc) {
+        g_szDirectTrackPath = argv[i + 1];
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr, "ERROR: '--track-path' needs an argument\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--track-asset-root") == 0) {
+      if (i + 1 < argc) {
+        g_szDirectTrackAssetRoot = argv[i + 1];
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr, "ERROR: '--track-asset-root' needs an argument\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--track-fallback-root") == 0) {
+      if (i + 1 < argc) {
+        g_szDirectTrackFallbackRoot = argv[i + 1];
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr, "ERROR: '--track-fallback-root' needs an argument\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--verify-track-state") == 0) {
+      g_bDirectTrackStateFixture = -1;
+      consumed = 1;
+    } else if (strcmp(argv[i], "--track-reload-malformed") == 0) {
+      if (i + 1 < argc
+          && g_iDirectTrackMalformedCount
+               < DIRECT_TRACK_RELOAD_MAX_MALFORMED) {
+        g_aszDirectTrackMalformed[g_iDirectTrackMalformedCount++] =
+          argv[i + 1];
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr,
+          "ERROR: '--track-reload-malformed' needs a path and accepts at most %d paths\n",
+          DIRECT_TRACK_RELOAD_MAX_MALFORMED);
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--track-reload-cycles") == 0) {
+      if (i + 1 < argc) {
+        g_iDirectTrackReloadCycles = atoi(argv[i + 1]);
+        if (g_iDirectTrackReloadCycles <= 0
+            || g_iDirectTrackReloadCycles > 1000) {
+          cli_fprintf(stderr,
+            "ERROR: '--track-reload-cycles' expects 1-1000\n");
+          return 1;
+        }
+        consumed = 2;
+      } else {
+        cli_fprintf(stderr,
+          "ERROR: '--track-reload-cycles' needs an argument\n");
+        return 1;
+      }
     }
     if (consumed < 0) {
       cli_fprintf(stderr, "ERROR: Unknown argument '%s'\n", argv[i]);
@@ -2900,6 +3022,35 @@ int main(int argc, const char **argv, const char **envp)
       return 1;
     }
     i += consumed;
+  }
+
+  if (szGpuParityBackend) {
+    if (g_bSnapshotMode || g_szDirectTrackPath) {
+      cli_fprintf(stderr, "ERROR: '--gpu-parity' cannot be combined with snapshot or track-path mode\n");
+      return 1;
+    }
+    return ROLLERGpuParityRun(szGpuParityBackend);
+  }
+  if ((g_bDirectTrackStateFixture
+       || g_szDirectTrackAssetRoot
+       || g_szDirectTrackFallbackRoot
+       || g_iDirectTrackMalformedCount
+       || g_iDirectTrackReloadCycles)
+      && !g_szDirectTrackPath) {
+    cli_fprintf(stderr,
+      "ERROR: direct-track verification options require '--track-path'\n");
+    return 1;
+  }
+  if (g_szDirectTrackFallbackRoot && !g_szDirectTrackAssetRoot) {
+    cli_fprintf(stderr,
+      "ERROR: '--track-fallback-root' requires '--track-asset-root'\n");
+    return 1;
+  }
+  if ((g_iDirectTrackMalformedCount == 0)
+      != (g_iDirectTrackReloadCycles == 0)) {
+    cli_fprintf(stderr,
+      "ERROR: the reload soak requires malformed paths and a cycle count\n");
+    return 1;
   }
 
 #if defined(IS_ANDROID)
@@ -2952,7 +3103,9 @@ int main(int argc, const char **argv, const char **envp)
     // The CD-image extraction prompt, replays directory bootstrap, and audio
     // probe are all interactive or audio-device-dependent: skip in headless
     // snapshot mode. The replay file is loaded directly from cwd later.
+#if !defined(IS_ANDROID)
     InitFATDATA(whiplash_root);
+#endif
     InitREPLAYS(whiplash_root);
     InitTRACKS(whiplash_root);
     ROLLERGetAudioInfo();
@@ -3108,6 +3261,143 @@ int main(int argc, const char **argv, const char **envp)
   if (!frontend_shutdown_complete())
     doexit();
   return 0;
+}
+#endif
+
+//-------------------------------------------------------------------------------------------------
+//00012050
+static void direct_track_seed_community_state(void)
+{
+  memset(g_aszCommunityTracks, 0, sizeof(g_aszCommunityTracks));
+  snprintf(g_aszCommunityTracks[0],
+           sizeof(g_aszCommunityTracks[0]), "ALPHA.TRK");
+  snprintf(g_aszCommunityTracks[1],
+           sizeof(g_aszCommunityTracks[1]), "BETA.TRK");
+  snprintf(g_aszCommunityTracks[2],
+           sizeof(g_aszCommunityTracks[2]), "GAMMA.TRK");
+  g_iCommunityTrackCount = 3;
+  g_iCommunityTrackSel = 1;
+  g_iCommunityTrackTop = 1;
+  g_iCommunityTrackMissing = -1;
+  g_uiCommunityTrackCRC = 0xD15EA5E5u;
+}
+
+static uint64 direct_track_hash_bytes(uint64 ullHash,
+                                      const void *pData,
+                                      size_t uiSize)
+{
+  const uint8 *pbyData = pData;
+
+  for (size_t i = 0; i < uiSize; i++) {
+    ullHash ^= pbyData[i];
+    ullHash *= UINT64_C(1099511628211);
+  }
+  return ullHash;
+}
+
+static uint64 direct_track_scene_hash(void)
+{
+  uint64 ullHash = UINT64_C(14695981039346656037);
+  size_t uiChunks = TRAK_LEN > 0 && TRAK_LEN <= MAX_TRACK_CHUNKS
+    ? (size_t)TRAK_LEN
+    : 0u;
+
+#define HASH_SCENE(value) \
+  ullHash = direct_track_hash_bytes( \
+    ullHash, &(value), sizeof(value))
+  HASH_SCENE(TRAK_LEN);
+  HASH_SCENE(NumBuildings);
+  HASH_SCENE(NumTowers);
+  HASH_SCENE(texture_file);
+  HASH_SCENE(bldtex_file);
+#undef HASH_SCENE
+  ullHash = direct_track_hash_bytes(
+    ullHash, TrakPt, uiChunks * sizeof(TrakPt[0]));
+  ullHash = direct_track_hash_bytes(
+    ullHash, GroundPt, uiChunks * sizeof(GroundPt[0]));
+  ullHash = direct_track_hash_bytes(
+    ullHash, TrakColour, uiChunks * sizeof(TrakColour[0]));
+  ullHash = direct_track_hash_bytes(
+    ullHash, GroundColour, uiChunks * sizeof(GroundColour[0]));
+  ullHash = direct_track_hash_bytes(
+    ullHash, TrackInfo, uiChunks * sizeof(TrackInfo[0]));
+  return ullHash;
+}
+
+static void direct_track_memory_summary(int *piActiveBlocks,
+                                        uint64 *pullTrackedBytes)
+{
+  int iActiveBlocks = 0;
+  uint64 ullTrackedBytes = 0;
+
+  for (int i = 0; i < MEM_BLOCK_COUNT; i++) {
+    if (mem_blocks[i].pBuf) {
+      iActiveBlocks++;
+      ullTrackedBytes += mem_blocks[i].uiSize;
+    }
+  }
+  *piActiveBlocks = iActiveBlocks;
+  *pullTrackedBytes = ullTrackedBytes;
+}
+
+static int direct_track_run_reload_soak(void)
+{
+  const uint64 ullExpectedSceneHash = direct_track_scene_hash();
+  int iExpectedActiveBlocks;
+  uint64 ullExpectedTrackedBytes;
+
+  direct_track_memory_summary(
+    &iExpectedActiveBlocks, &ullExpectedTrackedBytes);
+  for (int iCycle = 0; iCycle < g_iDirectTrackReloadCycles; iCycle++) {
+    for (int iMalformed = 0;
+         iMalformed < g_iDirectTrackMalformedCount;
+         iMalformed++) {
+      uint64 ullBeforeFailure = direct_track_scene_hash();
+      int iGenerationBeforeFailure = g_iTrackLoadGeneration;
+      int iActiveBlocks;
+      uint64 ullTrackedBytes;
+
+      if (loadtrack_from_path(
+            g_aszDirectTrackMalformed[iMalformed], 0)
+          == ROLLER_ED_RESULT_OK) {
+        SDL_Log("F-S3 FAIL: malformed fixture %d loaded in cycle %d",
+                iMalformed, iCycle);
+        return 0;
+      }
+      direct_track_memory_summary(&iActiveBlocks, &ullTrackedBytes);
+      if (g_iTrackLoadGeneration != iGenerationBeforeFailure
+          || direct_track_scene_hash() != ullBeforeFailure
+          || iActiveBlocks != iExpectedActiveBlocks
+          || ullTrackedBytes != ullExpectedTrackedBytes) {
+        SDL_Log("F-S3 FAIL: rejected fixture mutated live state/resources in cycle %d",
+                iCycle);
+        return 0;
+      }
+      ROLLERrandStateSet(g_uiDirectTrackSeedBeforeLoad);
+      if (loadtrack_from_path(g_szDirectTrackPath, 0)
+            != ROLLER_ED_RESULT_OK
+          || g_iTrackLoadGeneration != iGenerationBeforeFailure + 1
+          || direct_track_scene_hash() != ullExpectedSceneHash
+          || ROLLERrandStateGet() != g_uiDirectTrackSeedAfterLoad) {
+        SDL_Log("F-S3 FAIL: valid recovery failed in cycle %d",
+                iCycle);
+        return 0;
+      }
+      direct_track_memory_summary(&iActiveBlocks, &ullTrackedBytes);
+      if (iActiveBlocks != iExpectedActiveBlocks
+          || ullTrackedBytes != ullExpectedTrackedBytes) {
+        SDL_Log("F-S3 FAIL: tracked allocation drift after recovery cycle %d (%d/%d blocks, %llu/%llu bytes)",
+                iCycle, iActiveBlocks, iExpectedActiveBlocks,
+                (unsigned long long)ullTrackedBytes,
+                (unsigned long long)ullExpectedTrackedBytes);
+        return 0;
+      }
+    }
+  }
+  SDL_Log("F-S3 PASS: %d valid/malformed/valid cycles across %d malformed classes; scene and tracked allocations stable",
+          g_iDirectTrackReloadCycles,
+          g_iDirectTrackMalformedCount);
+  return -1;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -3304,7 +3594,40 @@ void play_game_init()
   finishers = 0;
   human_finishers = 0;
   setreplaytrack();
-  loadtrack(game_track, 0);                     // Load track data and initialize game world
+  if (g_bDirectTrackStateFixture)
+    direct_track_seed_community_state();
+  if (g_szDirectTrackPath) {
+    char szDirectLoadError[512];
+    eRollerEdResult eDirectLoadResult;
+
+    g_uiDirectTrackSeedBeforeLoad = ROLLERrandStateGet();
+    if (g_szDirectTrackAssetRoot) {
+      eDirectLoadResult = loadtrack_from_path_with_assets_ex(
+        g_szDirectTrackPath, g_szDirectTrackAssetRoot,
+        g_szDirectTrackFallbackRoot ? g_szDirectTrackFallbackRoot : ".", 0,
+        szDirectLoadError, sizeof(szDirectLoadError));
+    } else {
+      eDirectLoadResult = loadtrack_from_path_ex(
+        g_szDirectTrackPath, 0, szDirectLoadError, sizeof(szDirectLoadError));
+    }
+    if (eDirectLoadResult != ROLLER_ED_RESULT_OK) {
+      SDL_Log("Direct track load failed for '%s': %s",
+              g_szDirectTrackPath, szDirectLoadError);
+      doexit();
+      return;
+    }
+    g_uiDirectTrackSeedAfterLoad = ROLLERrandStateGet();
+    if (g_bDirectTrackStateFixture) {
+      SDL_Log("F-S2 PASS: populated community discovery and selection state remained unchanged");
+    }
+    if (g_iDirectTrackReloadCycles
+        && !direct_track_run_reload_soak()) {
+      doexit();
+      return;
+    }
+  } else {
+    loadtrack(game_track, 0);                   // Load track data and initialize game world
+  }
   LoadGenericCarTextures();
   InitCars();
   if (game_type >= 2)                         // Set lap count based on game type (championship vs single race)
@@ -4892,7 +5215,8 @@ HANDLE_SPECIAL_MODES:
       start_time = curr_time;
     }
   }
-  touch_ui_render_game(winw > 0 ? winw : XMAX, winh > 0 ? winh : YMAX);
+  if (ROLLERPhoneUIActive())
+    touch_ui_render_game(winw > 0 ? winw : XMAX, winh > 0 ? winh : YMAX);
   if (draw_type != 2)                         // Final screen buffer copy to destination
     copypic(pSrc, pDest);
 }

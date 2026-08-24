@@ -29,6 +29,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import org.libsdl.app.SDLActivity;
@@ -46,19 +47,26 @@ public class RollerActivity extends SDLActivity {
     private static final int NAME_ENTRY_TARGET_REPLAY = 2;
     private Dialog nameEntryDialog;
     private int nameEntryDialogTarget;
+    private Dialog extractionProgressDialog;
 
     private static native void nativeNameEntryComplete(String value, boolean accepted);
     private static native void nativeReplayNameEntryComplete(String value, boolean accepted);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
                 WindowManager.LayoutParams.FLAG_FULLSCREEN);
         syncMidiAssets();
         super.onCreate(savedInstanceState);
         enterFullscreen();
+    }
+
+    public void setLandscapeModeEnabled(boolean enabled) {
+        runOnUiThread(() -> setRequestedOrientation(enabled
+                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR));
     }
 
     @Override
@@ -107,6 +115,87 @@ public class RollerActivity extends SDLActivity {
         }
     }
 
+    public void setExtractionProgressVisible(boolean visible) {
+        runOnUiThread(() -> {
+            if (visible) {
+                showExtractionProgressOnUiThread();
+            } else {
+                hideExtractionProgressOnUiThread();
+            }
+        });
+    }
+
+    private void showExtractionProgressOnUiThread() {
+        if (isFinishing() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1
+                && isDestroyed())) {
+            return;
+        }
+
+        if (extractionProgressDialog != null) {
+            extractionProgressDialog.dismiss();
+        }
+
+        Dialog dialog = new Dialog(this);
+        extractionProgressDialog = dialog;
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        dialog.setCancelable(false);
+        dialog.setCanceledOnTouchOutside(false);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setPadding(dp(40), dp(40), dp(40), dp(40));
+        root.setBackgroundColor(Color.BLACK);
+
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminate(true);
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
+                dp(64), dp(64));
+        progressParams.setMargins(0, 0, 0, dp(28));
+        root.addView(progress, progressParams);
+
+        TextView title = new TextView(this);
+        title.setText("EXTRACTING GAME DATA");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(22.0f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setGravity(Gravity.CENTER);
+        root.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView message = new TextView(this);
+        message.setText("Importing the selected CD image.\nThis may take a minute. Please wait.");
+        message.setTextColor(Color.LTGRAY);
+        message.setTextSize(16.0f);
+        message.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams messageParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        messageParams.setMargins(0, dp(16), 0, 0);
+        root.addView(message, messageParams);
+
+        dialog.setContentView(root);
+        dialog.show();
+
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT);
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+        enterFullscreen();
+    }
+
+    private void hideExtractionProgressOnUiThread() {
+        if (extractionProgressDialog != null) {
+            extractionProgressDialog.dismiss();
+            extractionProgressDialog = null;
+        }
+        enterFullscreen();
+    }
+
     public void showNameEntryDialog(String currentName) {
         runOnUiThread(() -> showNameEntryDialogOnUiThread(
                 "ENTER NAME", currentName, NAME_ENTRY_TARGET_CONFIG));
@@ -147,6 +236,7 @@ public class RollerActivity extends SDLActivity {
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
         EditText edit = new EditText(this);
+        boolean allowSpaces = target == NAME_ENTRY_TARGET_CONFIG;
         edit.setSingleLine(true);
         edit.setGravity(Gravity.CENTER);
         edit.setTextColor(Color.WHITE);
@@ -159,10 +249,10 @@ public class RollerActivity extends SDLActivity {
                 | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         edit.setImeOptions(EditorInfo.IME_ACTION_DONE);
         edit.setFilters(new InputFilter[] {
-                new NameInputFilter(),
+                new NameInputFilter(allowSpaces),
                 new InputFilter.LengthFilter(8),
         });
-        edit.setText(sanitizeName(currentName));
+        edit.setText(sanitizeName(currentName, allowSpaces));
         edit.setSelection(edit.getText().length());
 
         LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(
@@ -237,7 +327,9 @@ public class RollerActivity extends SDLActivity {
         nameEntryDialogTarget = 0;
         dialog.dismiss();
         enterFullscreen();
-        String sanitizedValue = accepted ? sanitizeName(value) : "";
+        String sanitizedValue = accepted
+                ? sanitizeName(value, target == NAME_ENTRY_TARGET_CONFIG)
+                : "";
         if (target == NAME_ENTRY_TARGET_REPLAY) {
             nativeReplayNameEntryComplete(sanitizedValue, accepted);
         } else {
@@ -250,14 +342,14 @@ public class RollerActivity extends SDLActivity {
         return Math.round((float)value * density);
     }
 
-    private static String sanitizeName(String value) {
+    private static String sanitizeName(String value, boolean allowSpaces) {
         if (value == null) {
             return "";
         }
 
         StringBuilder builder = new StringBuilder(8);
         for (int i = 0; i < value.length() && builder.length() < 8; ++i) {
-            char ch = sanitizeNameChar(value.charAt(i));
+            char ch = sanitizeNameChar(value.charAt(i), allowSpaces);
             if (ch != 0) {
                 builder.append(ch);
             }
@@ -265,17 +357,24 @@ public class RollerActivity extends SDLActivity {
         return builder.toString();
     }
 
-    private static char sanitizeNameChar(char ch) {
+    private static char sanitizeNameChar(char ch, boolean allowSpaces) {
         if (ch >= 'a' && ch <= 'z') {
             ch = (char)(ch - ('a' - 'A'));
         }
-        if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+                || (allowSpaces && ch == ' ')) {
             return ch;
         }
         return 0;
     }
 
     private static final class NameInputFilter implements InputFilter {
+        private final boolean allowSpaces;
+
+        NameInputFilter(boolean allowSpaces) {
+            this.allowSpaces = allowSpaces;
+        }
+
         @Override
         public CharSequence filter(CharSequence source, int start, int end,
                 Spanned dest, int dstart, int dend) {
@@ -284,7 +383,7 @@ public class RollerActivity extends SDLActivity {
 
             for (int i = start; i < end; ++i) {
                 char original = source.charAt(i);
-                char ch = sanitizeNameChar(original);
+                char ch = sanitizeNameChar(original, allowSpaces);
                 if (ch == 0) {
                     changed = true;
                     continue;

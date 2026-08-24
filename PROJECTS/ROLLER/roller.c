@@ -11,6 +11,7 @@
 #include "graphics.h"
 #include "menu_render.h"
 #include "moving.h"
+#include "phone_ui.h"
 #include "debug_overlay.h"
 #include "snapshot.h"
 #include "rollercd.h"
@@ -27,6 +28,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#if defined(_WIN32)
+#define strtok_r strtok_s
+#endif
 #if !defined(IS_ANDROID) && !defined(IS_WASM)
 #include <SDL3_image/SDL_image.h>
 #endif
@@ -34,12 +38,12 @@
 #include <jni.h>
 #include <SDL3/SDL_system.h>
 #endif
-#if !defined(IS_ANDROID) && !defined(IS_WASM)
+#if !defined(ROLLER_EDITOR_CORE) && !defined(IS_ANDROID) && !defined(IS_WASM)
 #include <wildmidi_lib.h>
 #endif
 #include <fcntl.h>
 #include <sys/stat.h>
-#if !defined(IS_ANDROID)
+#if !defined(ROLLER_EDITOR_CORE) && !defined(IS_ANDROID)
 #include <cdio/cdio.h>
 #include <cdio/iso9660.h>
 #include <cdio/disc.h>
@@ -109,12 +113,9 @@ static SDL_GPUTexture *s_pGameTexture = NULL;
 static SDL_GPUTransferBuffer *s_pTransferBuffer = NULL;
 #endif
 static int s_iGPUPresentSkipFrames = 0;
-/* Hard-disables GPU swapchain presentation while set. Used on Android during the
- * InitFATDATA import flow, where showing native dialogs (message box + SAF file
- * picker) destroys/recreates the Activity surface; driving the SDL Vulkan renderer
- * against the in-flux surface corrupts the Adreno driver (libvulkan crash /
- * destroyed-mutex abort on the HWUI RenderThread). */
-static bool s_bGpuPresentDisabled = false;
+#if defined(IS_ANDROID)
+static bool s_bAndroidDefaultConfigPending = false;
+#endif
 bool g_bPaletteSet = false;
 float g_fDrawDistanceFraction = 1.0f;
 bool g_bNoCollisionLimit = true;
@@ -310,9 +311,6 @@ static void DeferGPUPresentation(int iFrames)
 
 bool ROLLERGpuPresentationSuspended(void)
 {
-  if (s_bGpuPresentDisabled)
-    return true;
-
   if (!s_pWindow)
     return true;
 
@@ -529,7 +527,8 @@ void UpdateSDLWindow()
   if (ROLLERGpuPresentationSuspended()) return;
 
 #if defined(IS_WASM)
-  ROLLERPresentSDLRendererFrame(scrbuf, pal_addr, winw, winh);
+  ROLLERPresentSDLRendererFrame(scrbuf, pal_addr, winw, winh,
+                                s_pDebugOverlay);
 #else
   // Acquire command buffer
   SDL_GPUCommandBuffer *cmdBuf = SDL_AcquireGPUCommandBuffer(s_pGPUDevice);
@@ -613,9 +612,9 @@ void UpdateSDLWindow()
 static void PresentDebugOverlayOnly(void)
 {
 #if defined(IS_WASM)
-  if (!s_pWindow || ROLLERGpuPresentationSuspended())
+  if (!s_pWindow || !s_pDebugOverlay || ROLLERGpuPresentationSuspended())
     return;
-  ROLLERPresentSDLRendererClear();
+  ROLLERPresentSDLRendererOverlayOnly(s_pDebugOverlay);
 #else
   if (!s_pGPUDevice || !s_pWindow || !s_pDebugOverlay)
     return;
@@ -650,7 +649,7 @@ static void PresentDebugOverlayOnly(void)
 
 void ROLLERRefreshStartupOverlay()
 {
-  if (!s_pWindow || !s_pDebugOverlay)
+  if (!s_pWindow)
     return;
 
   SDL_Event e;
@@ -661,14 +660,16 @@ void ROLLERRefreshStartupOverlay()
       exit(0);
     }
 
-    if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_GRAVE)
+    if (s_pDebugOverlay && e.type == SDL_EVENT_KEY_DOWN &&
+        e.key.scancode == SDL_SCANCODE_GRAVE)
       debug_overlay_toggle(s_pDebugOverlay);
-    else
+    else if (s_pDebugOverlay)
       (void)debug_overlay_handle_event(s_pDebugOverlay, &e);
   }
 
   UpdateMouseCursorVisibility();
-  PresentDebugOverlayOnly();
+  if (s_pDebugOverlay)
+    PresentDebugOverlayOnly();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -832,6 +833,17 @@ int InitSDL(char *whiplash_root, const char *midi_root)
     return 1;
   }
 
+#if defined(IS_ANDROID)
+  InputInit();
+
+  /* The Android file picker backgrounds the Activity and replaces its native
+   * surface. Run first-launch import before claiming the window for a GPU device
+   * so every swapchain and renderer resource is created against the restored
+   * surface. Reusing resources created before the picker leaves a black frame on
+   * some Vulkan drivers until the process is restarted. */
+  InitFATDATA(whiplash_root);
+#endif
+
 #if defined(IS_WASM)
   if (!ROLLERPresentSDLRendererInit(s_pWindow, g_bVsync)) {
     ErrorBoxExit("Couldn't create SDL_Renderer presentation: %s", SDL_GetError());
@@ -839,6 +851,9 @@ int InitSDL(char *whiplash_root, const char *midi_root)
   }
 
   s_pMenuRenderer = menu_render_create(NULL, s_pWindow);
+  s_pDebugOverlay = debug_overlay_create(NULL, s_pWindow);
+  if (!s_pDebugOverlay)
+    SDL_Log("debug_overlay: failed to create SDL_Renderer backend");
 #else
   s_pGPUDevice = SDL_CreateGPUDevice(
     SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_DXIL,
@@ -908,6 +923,13 @@ int InitSDL(char *whiplash_root, const char *midi_root)
   }
 #endif
 
+#if defined(IS_ANDROID)
+  if (s_bAndroidDefaultConfigPending) {
+    SaveDefaultFatalIni(whiplash_root);
+    s_bAndroidDefaultConfigPending = false;
+  }
+#endif
+
 #if !defined(IS_ANDROID) && !defined(IS_WASM)
   SDL_Surface *pIcon = IMG_Load("roller.ico");
   SDL_SetWindowIcon(s_pWindow, pIcon);
@@ -922,7 +944,9 @@ int InitSDL(char *whiplash_root, const char *midi_root)
   SDL_SetWindowPosition(s_pWindow, sdl_window_centered, sdl_window_centered);
 #endif
 
+#if !defined(IS_ANDROID)
   InputInit();
+#endif
 
 #if !defined(IS_WASM)
   char localMidiPath[256];
@@ -1189,6 +1213,41 @@ cleanup:
 
 //-------------------------------------------------------------------------------------------------
 
+static void AndroidSetExtractionProgressVisible(bool bVisible)
+{
+  JNIEnv *pEnv = (JNIEnv *)SDL_GetAndroidJNIEnv();
+  jobject activity = NULL;
+  jclass activityClass = NULL;
+
+  if (!pEnv)
+    return;
+
+  activity = (jobject)SDL_GetAndroidActivity();
+  if (!activity)
+    return;
+
+  activityClass = (*pEnv)->GetObjectClass(pEnv, activity);
+  if (activityClass) {
+    jmethodID setVisible = (*pEnv)->GetMethodID(
+        pEnv, activityClass, "setExtractionProgressVisible", "(Z)V");
+    if (setVisible) {
+      (*pEnv)->CallVoidMethod(pEnv, activity, setVisible,
+                              bVisible ? JNI_TRUE : JNI_FALSE);
+    }
+
+    if ((*pEnv)->ExceptionCheck(pEnv)) {
+      (*pEnv)->ExceptionDescribe(pEnv);
+      (*pEnv)->ExceptionClear(pEnv);
+    }
+  }
+
+  if (activityClass)
+    (*pEnv)->DeleteLocalRef(pEnv, activityClass);
+  (*pEnv)->DeleteLocalRef(pEnv, activity);
+}
+
+//-------------------------------------------------------------------------------------------------
+
 static bool AndroidPathEndsWithIgnoreCase(const char *szPath, const char *szExt)
 {
   size_t nPath = strlen(szPath);
@@ -1345,8 +1404,9 @@ static void ROLLERApplyWebDefaultConfig(void)
   if (pMenuRenderer)
     menu_render_set_mode(pMenuRenderer, MENU_RENDER_SOFTWARE);
 
-  // E5 applies runtime phone-control defaults here before the same writer once
-  // the browser phone-mode signal and WASM phone controls exist.
+  if (ROLLERPhoneUIActive()) {
+    g_ePhoneControls = PHONE_CONTROLS_TILT_TURN;
+  }
 }
 
 static void ROLLEREnsureWebDefaultConfig(const char *szDataRoot)
@@ -1389,13 +1449,6 @@ void InitFATDATA(const char *szDataRoot)
     bool bSelectedFiles = false;
     bool bImported = false;
 
-    // Showing native dialogs (message box + SAF picker) below destroys and
-    // recreates the Activity surface. Driving the SDL Vulkan renderer against the
-    // in-flux surface crashes the Adreno driver, so suppress all GPU presentation
-    // for the whole import flow. ROLLERRefreshStartupOverlay() still pumps events
-    // (needed for the picker callback and SDL_EVENT_QUIT); it just won't present.
-    s_bGpuPresentDisabled = true;
-
     if (AndroidPromptForCdImage()) {
       SDL_DialogFileFilter filters[] = { { "CD Images", "iso;bin;cue;ISO;BIN;CUE" } };
       tDialogResult result = { 0 };
@@ -1411,14 +1464,17 @@ void InitFATDATA(const char *szDataRoot)
       if (!result.bCancelled && result.iNumPaths > 0) {
         bSelectedFiles = true;
         char szStagedEntry[ROLLER_MAX_PATH];
+        AndroidSetExtractionProgressVisible(true);
         if (AndroidStageCdImageSelection(&result, szDataRoot, szStagedEntry,
                                          sizeof(szStagedEntry))) {
           ROLLERRefreshStartupOverlay();
           ExtractFATDATA(szStagedEntry, szDataRoot);
-          SaveDefaultFatalIni(szDataRoot); //save default config after extraction so all users will have svga, sfx, and music on by default
           ROLLERRefreshStartupOverlay();
           bImported = ROLLERdirexists("./FATDATA") || ROLLERdirexists("./fatdata");
+          if (bImported)
+            s_bAndroidDefaultConfigPending = true;
         }
+        AndroidSetExtractionProgressVisible(false);
       }
     }
 
@@ -1435,8 +1491,7 @@ void InitFATDATA(const char *szDataRoot)
       }
     }
 
-    // Re-enable GPU presentation now that all native dialogs are dismissed.
-    s_bGpuPresentDisabled = false;
+    // Let the restored Android surface settle before the first GPU presentation.
     DeferGPUPresentation(ROLLER_RESIZE_DEFER_FRAMES);
 #elif !defined(IS_WASM)
     // Browser asset selection and retail extraction are completed by the page
@@ -1619,22 +1674,41 @@ void ShutdownSDL()
     InputShutdown();
 
 #if defined(IS_WASM)
-    menu_render_destroy(s_pMenuRenderer);
+    if (s_pDebugOverlay)
+      debug_overlay_destroy(s_pDebugOverlay);
+    s_pDebugOverlay = NULL;
+    if (s_pMenuRenderer)
+      menu_render_destroy(s_pMenuRenderer);
     s_pMenuRenderer = NULL;
     ROLLERPresentSDLRendererShutdown();
-    SDL_DestroyWindow(s_pWindow);
+    if (s_pWindow)
+      SDL_DestroyWindow(s_pWindow);
     s_pWindow = NULL;
 #else
-    debug_overlay_destroy(s_pDebugOverlay);
+    if (s_pDebugOverlay)
+      debug_overlay_destroy(s_pDebugOverlay);
     s_pDebugOverlay = NULL;
-    crt_filter_destroy(s_pCRTFilter);
+    if (s_pCRTFilter)
+      crt_filter_destroy(s_pCRTFilter);
     s_pCRTFilter = NULL;
-    menu_render_destroy(s_pMenuRenderer);
-    SDL_ReleaseGPUTexture(s_pGPUDevice, s_pGameTexture);
-    SDL_ReleaseGPUTransferBuffer(s_pGPUDevice, s_pTransferBuffer);
-    SDL_ReleaseWindowFromGPUDevice(s_pGPUDevice, s_pWindow);
-    SDL_DestroyGPUDevice(s_pGPUDevice);
-    SDL_DestroyWindow(s_pWindow);
+    if (s_pMenuRenderer)
+      menu_render_destroy(s_pMenuRenderer);
+    s_pMenuRenderer = NULL;
+    if (s_pGPUDevice) {
+      if (s_pGameTexture)
+        SDL_ReleaseGPUTexture(s_pGPUDevice, s_pGameTexture);
+      if (s_pTransferBuffer)
+        SDL_ReleaseGPUTransferBuffer(s_pGPUDevice, s_pTransferBuffer);
+      if (s_pWindow)
+        SDL_ReleaseWindowFromGPUDevice(s_pGPUDevice, s_pWindow);
+      SDL_DestroyGPUDevice(s_pGPUDevice);
+    }
+    s_pGameTexture = NULL;
+    s_pTransferBuffer = NULL;
+    s_pGPUDevice = NULL;
+    if (s_pWindow)
+      SDL_DestroyWindow(s_pWindow);
+    s_pWindow = NULL;
 #endif
   }
 
@@ -2594,6 +2668,20 @@ int ROLLERrandRaw(void)
 {
   g_uiRandState = g_uiRandState * 1103515245u + 12345u;
   return (int)((g_uiRandState >> 16) & 0x7FFFu);
+}
+
+//-------------------------------------------------------------------------------------------------
+
+uint32 ROLLERrandStateGet(void)
+{
+  return g_uiRandState;
+}
+
+//-------------------------------------------------------------------------------------------------
+
+void ROLLERrandStateSet(uint32 uiState)
+{
+  g_uiRandState = uiState;
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -1,7 +1,10 @@
 #ifndef _ROLLER_LOADTRAK_H
 #define _ROLLER_LOADTRAK_H
 //-------------------------------------------------------------------------------------------------
+#include "editor_api.h"
+#include "editor_track_loader.h"
 #include "types.h"
+#include <stddef.h>
 #include <stdio.h>
 //-------------------------------------------------------------------------------------------------
 
@@ -62,6 +65,7 @@ extern int cur_mapsect;
 extern float cur_TrackZ;
 extern float cur_mapsize;
 extern int TRAK_LEN;
+extern float TrackFloorHeight;
 extern int16 samplemin[MAX_SAMPLES];
 extern int cur_laps[6];
 extern uint8 fp_buf[512];
@@ -97,7 +101,53 @@ int community_track_available(void);
 uint32 community_track_crc(const char *szPath);
 int stock_track_available(int iTrackIdx);
 int stock_track_demo_only(void);
-void loadtrack(int iTrackIdx, int iPreviewMode);
+eRollerEdResult loadtrack(int iTrackIdx, int iPreviewMode);
+/* Loads a track directly without consulting or mutating community discovery.
+ * szTrackPath must be absolute. Returns OK only after a complete load. */
+eRollerEdResult loadtrack_from_path(const char *szTrackPath, int iPreviewMode);
+eRollerEdResult loadtrack_from_path_ex(
+    const char *szTrackPath, int iPreviewMode,
+    char *szError, size_t uiErrorCapacity);
+eRollerEdResult loadtrack_from_path_with_assets_ex(
+    const char *szTrackPath,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError,
+    size_t uiErrorCapacity);
+/* Installs an already validated stage without re-reading or re-decoding the
+ * track. When roots are supplied, all render assets use document-first then
+ * configured-root lookup. */
+eRollerEdResult loadtrack_from_stage_with_assets_ex(
+    const char *szTrackPath,
+    const tEdTrackStage *pTrackStage,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError,
+    size_t uiErrorCapacity);
+/* Editor-only installation mode. It commits the same staged track and asset
+ * semantics while deliberately omitting gameplay cars and car-derived view
+ * initialization. This is an internal seam, not part of the public C ABI. */
+eRollerEdResult loadtrack_from_stage_with_assets_editor_ex(
+    const char *szTrackPath,
+    const tEdTrackStage *pTrackStage,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError,
+    size_t uiErrorCapacity);
+int roller_ed_track_only_active(void);
+/*
+ * E3A-S6. Resolves a bare legacy asset name against the roots the last editor
+ * load used -- document first, then the configured FATDATA root -- so an
+ * editor-only asset loaded after the track (the test car's texture bank) is
+ * found the same way the track's own textures were. Returns non-zero and
+ * writes an existing path on success. In the game, where no editor roots were
+ * ever recorded, this is just the bare name.
+ */
+int loadtrack_resolve_editor_asset(const char *szAsset,
+                                   char szResolved[ROLLER_MAX_PATH]);
 void read_backs(uint8 **ppTrackData);
 void read_texturemap(uint8 **ppTrackData);
 void read_bldmap(uint8 **ppTrackData);

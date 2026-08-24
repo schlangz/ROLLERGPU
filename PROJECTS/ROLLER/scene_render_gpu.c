@@ -4,6 +4,9 @@
 #include "polytex.h"              /* startsx, startsy */
 #include "sound.h"                /* pal_addr */
 #include "game_scene_shaders.h"   /* scene vertex/pixel SPIRV+MSL */
+#if defined(_WIN32)
+#include "game_dxil_shaders.h"    /* scene/car/HUD/particle DXIL */
+#endif
 #include "menu_shaders.h"         /* menu_mesh_* — reused for car pipeline */
 #include "game_hud_shaders.h"     /* HUD overlay vertex/pixel */
 #include "game_particle_shaders.h" /* particle vertex/pixel */
@@ -15,6 +18,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <limits.h>
 
 /* palette[256]: correctly filled by setpal(); use instead of pal_addr
  * (pal_addr is the raw 3-byte-per-entry file buffer, which gives wrong G/B
@@ -154,6 +158,7 @@ typedef struct {
 struct SceneRendererGPU {
     SDL_GPUDevice  *device;
     SDL_Window     *window;
+    SDL_GPUTextureFormat colorTargetFormat;
 
     /* ---- 3D scene pipeline (SceneGPUVertex: pos[3] + uv[2]) ---- */
     SDL_GPUGraphicsPipeline *opaquePipeline;
@@ -279,6 +284,8 @@ struct SceneRendererGPU {
     /* ---- Per-frame SDL3 state ---- */
     SDL_GPUCommandBuffer *cmdBuf;
     SDL_GPUTexture       *swapchainTex;
+    SDL_GPUTransferBuffer *readbackXfer;
+    Uint32                 readbackCapacity;
 
     /* ---- Texture bank ---- */
     SceneGPUTextureSlot texSlots[SCENE_GPU_MAX_TEXTURE_SLOTS];
@@ -290,6 +297,7 @@ struct SceneRendererGPU {
 
     /* ---- Viewport ---- */
     int viewportX, viewportY, viewportW, viewportH;
+    int projectionReferenceHeight;
 
     /* ---- Sky clear color ---- */
     float skyR, skyG, skyB;
@@ -465,6 +473,38 @@ static void indexed_to_rgba(const uint8 *src, const tColor *pal,
     }
 }
 
+static bool readback_format_supported(SDL_GPUTextureFormat format)
+{
+    return format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM
+        || format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB
+        || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM
+        || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
+static void copy_readback_to_rgba(uint8 *pbyDst, Uint32 uiDstPitch,
+                                  const uint8 *pbySrc, int iWidth, int iHeight,
+                                  SDL_GPUTextureFormat format)
+{
+    const Uint32 uiSrcPitch = (Uint32)iWidth * 4u;
+    bool bSwapRedBlue = format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM
+                     || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+
+    for (int iY = 0; iY < iHeight; iY++) {
+        uint8 *pbyDstRow = pbyDst + (size_t)iY * uiDstPitch;
+        const uint8 *pbySrcRow = pbySrc + (size_t)iY * uiSrcPitch;
+        if (!bSwapRedBlue) {
+            memcpy(pbyDstRow, pbySrcRow, uiSrcPitch);
+            continue;
+        }
+        for (int iX = 0; iX < iWidth; iX++) {
+            pbyDstRow[iX * 4 + 0] = pbySrcRow[iX * 4 + 2];
+            pbyDstRow[iX * 4 + 1] = pbySrcRow[iX * 4 + 1];
+            pbyDstRow[iX * 4 + 2] = pbySrcRow[iX * 4 + 0];
+            pbyDstRow[iX * 4 + 3] = pbySrcRow[iX * 4 + 3];
+        }
+    }
+}
+
 static Uint32 mip_level_count(int w, int h)
 {
     Uint32 n = 1;
@@ -615,7 +655,7 @@ static void ensure_offscreen_texture(SceneRendererGPU *r, int w, int h)
         SDL_ReleaseGPUTexture(r->device, r->offscreenTex);
     SDL_GPUTextureCreateInfo ti = {
         .type   = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .width  = (Uint32)w, .height = (Uint32)h,
         .layer_count_or_depth = 1, .num_levels = 1,
         .usage  = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER
@@ -638,7 +678,7 @@ static void ensure_secondary_textures(SceneRendererGPU *r, int slot, int w, int 
         if (sc > SDL_GPU_SAMPLECOUNT_1) {
             SDL_GPUTextureCreateInfo mci = {
                 .type = SDL_GPU_TEXTURETYPE_2D,
-                .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+                .format = r->colorTargetFormat,
                 .width = (Uint32)w, .height = (Uint32)h,
                 .layer_count_or_depth = 1, .num_levels = 1,
                 .sample_count = sc,
@@ -663,7 +703,7 @@ static void ensure_secondary_textures(SceneRendererGPU *r, int slot, int w, int 
     if (r->secondaryDepthTex[slot]) SDL_ReleaseGPUTexture(r->device, r->secondaryDepthTex[slot]);
     SDL_GPUTextureCreateInfo ci = {
         .type   = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .width  = (Uint32)w, .height = (Uint32)h,
         .layer_count_or_depth = 1, .num_levels = 1,
         .usage  = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER
@@ -699,7 +739,7 @@ static void ensure_msaa_textures(SceneRendererGPU *r, int w, int h)
     if (sc <= SDL_GPU_SAMPLECOUNT_1) return;
     SDL_GPUTextureCreateInfo ci = {
         .type = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .width = (Uint32)w, .height = (Uint32)h,
         .layer_count_or_depth = 1, .num_levels = 1,
         .sample_count = sc,
@@ -756,13 +796,24 @@ SDL_GPUTexture *scene_render_gpu_get_flat_color_texture(SceneRendererGPU *r, int
  *   shift_y = (vpH/2 - ss*(199-centerY)) / (vpH/2)
  *   clip.y += shift_y * fV.z  →  each column j: mvp[j*4+1] += shift_y * mvp[j*4+3]
  */
+static float effective_screen_scale(const SceneRendererGPU *r, int viewportHeight)
+{
+    float screenScale = (float)r->proj.screenScale / 64.0f;
+
+    if (r->projectionReferenceHeight > 0 && viewportHeight > 0)
+        screenScale *= (float)viewportHeight
+                     / (float)r->projectionReferenceHeight;
+    return screenScale;
+}
+
 static void build_mvp(float mvp[16],
                       const SceneRenderCamera *cam,
                       const SceneRenderProjection *proj,
                       int vpW, int vpH,
-                      float fovMult)
+                      float fovMult,
+                      float screenScale)
 {
-    float ss   = (float)proj->screenScale / 64.0f;
+    float ss   = screenScale;
     float fovX = (2.0f * cam->fovScale * fovMult * ss) / (float)vpW;
     float fovY = (2.0f * cam->fovScale * fovMult * ss) / (float)vpH;
     float zF   = SCENE_GPU_FAR  / (SCENE_GPU_FAR - SCENE_GPU_NEAR);
@@ -800,7 +851,8 @@ void scene_render_gpu_build_vp(const SceneRendererGPU *r, float vp[16])
 {
     int vpW = r->viewportW > 0 ? r->viewportW : 640;
     int vpH = r->viewportH > 0 ? r->viewportH : 400;
-    build_mvp(vp, &r->camera, &r->proj, vpW, vpH, r->fovMultiplier);
+    build_mvp(vp, &r->camera, &r->proj, vpW, vpH, r->fovMultiplier,
+              effective_screen_scale(r, vpH));
 }
 
 bool scene_render_gpu_project_to_ndc(const SceneRendererGPU *r,
@@ -819,7 +871,7 @@ bool scene_render_gpu_project_to_ndc(const SceneRendererGPU *r,
      * false in "Render Scale (native)" mode, which widens vpW independent of
      * winw to show a genuinely wider FOV, not just more pixels for the same
      * content. Projecting straight from camera-space is correct in every mode. */
-    float ss   = (float)r->proj.screenScale / 64.0f;
+    float ss   = effective_screen_scale(r, vpH);
     float fovX = (2.0f * r->camera.fovScale * r->fovMultiplier * ss) / (float)vpW;
     float fovY = (2.0f * r->camera.fovScale * r->fovMultiplier * ss) / (float)vpH;
     float horizon_y = ss * (199.0f - (float)r->proj.centerY);
@@ -836,6 +888,35 @@ bool scene_render_gpu_project_to_ndc(const SceneRendererGPU *r,
     *outNdcY = (float)(fovY * fvy / fvz + (double)shift_y);
     return true;
 }
+
+#if defined(_WIN32)
+static bool find_dxil_shader(const unsigned char *pbySpirv,
+                             const unsigned char **ppbyDxil,
+                             unsigned int *puiDxilSize)
+{
+#define MATCH_DXIL_SHADER(name) \
+    if (pbySpirv == name##_spirv) { \
+        *ppbyDxil = name##_dxil; \
+        *puiDxilSize = name##_dxil_size; \
+        return true; \
+    }
+    MATCH_DXIL_SHADER(game_scene_vertex)
+    MATCH_DXIL_SHADER(game_scene_pixel)
+    MATCH_DXIL_SHADER(game_scene_pixel_blend)
+    MATCH_DXIL_SHADER(game_scene_track_darken_pixel)
+    MATCH_DXIL_SHADER(game_scene_sign_pixel)
+    MATCH_DXIL_SHADER(game_car_vertex)
+    MATCH_DXIL_SHADER(game_car_pixel)
+    MATCH_DXIL_SHADER(game_hud_vertex)
+    MATCH_DXIL_SHADER(game_hud_pixel)
+    MATCH_DXIL_SHADER(game_particle_vertex)
+    MATCH_DXIL_SHADER(game_particle_pixel)
+    MATCH_DXIL_SHADER(game_particle_tex_vertex)
+    MATCH_DXIL_SHADER(game_particle_tex_pixel)
+#undef MATCH_DXIL_SHADER
+    return false;
+}
+#endif
 
 static SDL_GPUShader *load_shader(SDL_GPUDevice *dev, SDL_GPUShaderStage stage,
                                    const unsigned char *spirv, unsigned int spirv_sz,
@@ -856,6 +937,17 @@ static SDL_GPUShader *load_shader(SDL_GPUDevice *dev, SDL_GPUShaderStage stage,
         info.format = SDL_GPU_SHADERFORMAT_MSL;
         info.code = msl; info.code_size = msl_sz;
         info.entrypoint = "main0";
+#if defined(_WIN32)
+    } else if (fmts & SDL_GPU_SHADERFORMAT_DXIL) {
+        const unsigned char *pbyDxil = NULL;
+        unsigned int uiDxilSize = 0;
+        if (!find_dxil_shader(spirv, &pbyDxil, &uiDxilSize))
+            return NULL;
+        info.format = SDL_GPU_SHADERFORMAT_DXIL;
+        info.code = pbyDxil;
+        info.code_size = uiDxilSize;
+        info.entrypoint = "main";
+#endif
     } else {
         return NULL;
     }
@@ -883,7 +975,7 @@ static SDL_GPUGraphicsPipeline *make_scene_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     if (blendEnable) {
         ct.blend_state.enable_blend          = true;
@@ -952,7 +1044,7 @@ static SDL_GPUGraphicsPipeline *make_shadow_pipeline(SceneRendererGPU *r,
     SDL_GPUVertexBufferDescription binding = { .pitch = sizeof(SceneGPUVertex),
                                                .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1011,7 +1103,7 @@ static SDL_GPUGraphicsPipeline *make_track_darken_pipeline(SceneRendererGPU *r,
     SDL_GPUVertexBufferDescription binding = { .pitch = sizeof(SceneGPUVertex),
                                                .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_DST_COLOR,
@@ -1067,7 +1159,7 @@ static SDL_GPUGraphicsPipeline *make_sign_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     SDL_GPUGraphicsPipelineCreateInfo pi = {
         .vertex_shader   = vert,
@@ -1132,7 +1224,7 @@ static SDL_GPUGraphicsPipeline *make_sign_bk_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     SDL_GPUGraphicsPipelineCreateInfo pi = {
         .vertex_shader   = vert,
@@ -1189,7 +1281,7 @@ static SDL_GPUGraphicsPipeline *make_sign_depth_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     SDL_GPUGraphicsPipelineCreateInfo pi = {
         .vertex_shader   = vert,
@@ -1242,7 +1334,7 @@ static SDL_GPUGraphicsPipeline *make_tree_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     SDL_GPUGraphicsPipelineCreateInfo pi = {
         .vertex_shader   = vert,
@@ -1297,7 +1389,7 @@ static SDL_GPUGraphicsPipeline *make_car_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1366,7 +1458,7 @@ static SDL_GPUGraphicsPipeline *make_car_shadow_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1430,7 +1522,7 @@ static SDL_GPUGraphicsPipeline *make_sky_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window)
+        .format = r->colorTargetFormat
     };
     SDL_GPUGraphicsPipelineCreateInfo pi = {
         .vertex_shader   = vert,
@@ -1473,7 +1565,7 @@ static SDL_GPUGraphicsPipeline *make_particle_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1530,7 +1622,7 @@ static SDL_GPUGraphicsPipeline *make_tex_particle_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1584,7 +1676,7 @@ static SDL_GPUGraphicsPipeline *make_hud_pipeline(SceneRendererGPU *r,
         .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
     };
     SDL_GPUColorTargetDescription ct = {
-        .format = SDL_GetGPUSwapchainTextureFormat(r->device, r->window),
+        .format = r->colorTargetFormat,
         .blend_state = {
             .enable_blend          = true,
             .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
@@ -1622,10 +1714,17 @@ static void rebuild_scene_pipelines(SceneRendererGPU *r, SDL_GPUSampleCount sc, 
 
 SceneRendererGPU *scene_render_gpu_create(SDL_GPUDevice *device, SDL_Window *window)
 {
+    if (!device) return NULL;
     SceneRendererGPU *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->device = device;
     r->window = window;
+    /* F-S1 deliberately preserves the established windowed format while the
+     * new windowless path uses its fixed editor-facing RGBA8 target.  The
+     * readback API normalizes either format before comparison. */
+    r->colorTargetFormat = window
+        ? SDL_GetGPUSwapchainTextureFormat(device, window)
+        : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     r->anisotropyLevel = 3;   /* default 16x, matches old hardcoded value */
     r->renderScale     = 1.0f;
     r->gamma           = 1.0f;
@@ -1697,7 +1796,23 @@ SceneRendererGPU *scene_render_gpu_create(SDL_GPUDevice *device, SDL_Window *win
 
     /* ---- Scene shaders + pipelines ---- */
     rebuild_scene_pipelines(r, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_FILLMODE_FILL);
-    if (!r->opaquePipeline || !r->blendPipeline || !r->buildingPipeline || !r->bfBuildingPipeline || !r->signPipeline || !r->signBkPipeline || !r->signDepthPipeline || !r->signBkDepthPipeline || !r->treePipeline || !r->wallPipeline || !r->bfWallPipeline || !r->shadowPipeline || !r->trackDarkenPipeline || !r->trackDarkenBorderPipeline || !r->skyPipeline) goto fail;
+    if (!r->opaquePipeline || !r->blendPipeline || !r->buildingPipeline || !r->bfBuildingPipeline || !r->signPipeline || !r->signBkPipeline || !r->signDepthPipeline || !r->signBkDepthPipeline || !r->treePipeline || !r->wallPipeline || !r->bfWallPipeline || !r->shadowPipeline || !r->trackDarkenPipeline || !r->trackDarkenBorderPipeline || !r->skyPipeline) {
+        SDL_Log("scene_render_gpu: scene pipeline creation failed format=%d "
+                "opaque=%d blend=%d building=%d bfBuilding=%d sign=%d "
+                "signBk=%d signDepth=%d signBkDepth=%d tree=%d wall=%d "
+                "bfWall=%d shadow=%d darken=%d darkenBorder=%d sky=%d: %s",
+                (int)r->colorTargetFormat,
+                r->opaquePipeline != NULL, r->blendPipeline != NULL,
+                r->buildingPipeline != NULL, r->bfBuildingPipeline != NULL,
+                r->signPipeline != NULL, r->signBkPipeline != NULL,
+                r->signDepthPipeline != NULL, r->signBkDepthPipeline != NULL,
+                r->treePipeline != NULL, r->wallPipeline != NULL,
+                r->bfWallPipeline != NULL, r->shadowPipeline != NULL,
+                r->trackDarkenPipeline != NULL,
+                r->trackDarkenBorderPipeline != NULL, r->skyPipeline != NULL,
+                SDL_GetError());
+        goto fail;
+    }
 
     /* ---- Car shaders (game_car_* add fog+gamma; menu_mesh_* kept for menu) ---- */
     SDL_GPUShader *cv = load_shader(device, SDL_GPU_SHADERSTAGE_VERTEX,
@@ -1825,6 +1940,11 @@ fail:
     return NULL;
 }
 
+SceneRendererGPU *scene_render_gpu_create_windowless(SDL_GPUDevice *device)
+{
+    return scene_render_gpu_create(device, NULL);
+}
+
 void scene_render_gpu_destroy(SceneRendererGPU *r)
 {
     if (!r) return;
@@ -1849,6 +1969,7 @@ void scene_render_gpu_destroy(SceneRendererGPU *r)
         if (r->shadeLevelTex[i]) SDL_ReleaseGPUTexture(r->device, r->shadeLevelTex[i]);
     }
     if (r->offscreenTex)  SDL_ReleaseGPUTexture(r->device, r->offscreenTex);
+    if (r->readbackXfer)  SDL_ReleaseGPUTransferBuffer(r->device, r->readbackXfer);
     for (int i = 0; i < SCENE_GPU_MAX_SECONDARY_VIEWS; i++) {
         if (r->secondaryColorTex[i]) SDL_ReleaseGPUTexture(r->device, r->secondaryColorTex[i]);
         if (r->secondaryDepthTex[i]) SDL_ReleaseGPUTexture(r->device, r->secondaryDepthTex[i]);
@@ -2746,7 +2867,7 @@ void scene_render_gpu_begin_frame(SceneRendererGPU *r)
 
     r->cmdBuf      = NULL;
     r->swapchainTex = NULL;
-    if (r->pendingVsyncSet) {
+    if (r->window && r->pendingVsyncSet) {
         bool supportsMailbox = SDL_WindowSupportsGPUPresentMode(r->device, r->window,
                                    SDL_GPU_PRESENTMODE_MAILBOX);
         SDL_GPUPresentMode mode = r->pendingVsync
@@ -2774,17 +2895,16 @@ void scene_render_gpu_begin_frame(SceneRendererGPU *r)
     s_clickHit.active = false;
     s_clickWasPending = g_pendingClickQuery;
     r->cmdBuf = SDL_AcquireGPUCommandBuffer(r->device);
-    if (!r->cmdBuf) return;
-    if (!ROLLERTryAcquireGPUSwapchainTexture(r->cmdBuf, r->window,
-            &r->swapchainTex, NULL, NULL) || !r->swapchainTex) {
-        SDL_CancelGPUCommandBuffer(r->cmdBuf);
-        r->cmdBuf = NULL;
-    }
 }
 
-void scene_render_gpu_end_frame(SceneRendererGPU *r)
+static bool scene_render_gpu_end_frame_internal(SceneRendererGPU *r,
+                                                 uint8 *pbyPixels,
+                                                 Uint32 uiBufferSize,
+                                                 Uint32 uiRowPitch,
+                                                 Uint32 uiReadbackWidth,
+                                                 Uint32 uiReadbackHeight)
 {
-    if (!r || !r->cmdBuf) return;
+    if (!r || !r->cmdBuf) return false;
 
     Uint64 tQueueEnd = SDL_GetTicksNS();
     r->queueNs = tQueueEnd - r->frameStartNs;
@@ -2831,15 +2951,59 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
         g_pendingClickQuery = false;
     }
 
-    int nativeW = r->viewportW > 0 ? r->viewportW : 640;
-    int nativeH = r->viewportH > 0 ? r->viewportH : 400;
-    float rs = r->renderScale > 0.25f ? r->renderScale : 1.0f;
-    int renderW = (int)(nativeW * rs + 0.5f);
-    int renderH = (int)(nativeH * rs + 0.5f);
-    if (renderW < 1) renderW = 1;
-    if (renderH < 1) renderH = 1;
+    bool bReadback = pbyPixels != NULL;
+    int nativeW = 0;
+    int nativeH = 0;
+    float rs = 1.0f;
+    int renderW;
+    int renderH;
+    if (bReadback) {
+        if (uiReadbackWidth == 0 || uiReadbackHeight == 0
+                || uiReadbackWidth > INT_MAX
+                || uiReadbackHeight > INT_MAX) {
+            scene_render_gpu_cancel_frame(r);
+            return false;
+        }
+        renderW = (int)uiReadbackWidth;
+        renderH = (int)uiReadbackHeight;
+    } else {
+        nativeW = r->viewportW > 0 ? r->viewportW : 640;
+        nativeH = r->viewportH > 0 ? r->viewportH : 400;
+        rs = r->renderScale > 0.25f ? r->renderScale : 1.0f;
+        renderW = (int)(nativeW * rs + 0.5f);
+        renderH = (int)(nativeH * rs + 0.5f);
+        if (renderW < 1) renderW = 1;
+        if (renderH < 1) renderH = 1;
+    }
+    Uint64 ullPackedSize = (Uint64)(Uint32)renderW * (Uint64)(Uint32)renderH * 4u;
+    Uint64 ullCallerSize = (Uint64)uiRowPitch * (Uint64)(Uint32)renderH;
+    if (bReadback && (uiRowPitch < (Uint32)renderW * 4u
+                   || ullCallerSize > uiBufferSize
+                   || ullPackedSize > UINT32_MAX
+                   || !readback_format_supported(r->colorTargetFormat))) {
+        scene_render_gpu_cancel_frame(r);
+        return false;
+    }
     ensure_depth_texture(r, renderW, renderH);
     ensure_offscreen_texture(r, renderW, renderH);
+    if (!r->offscreenTex) {
+        scene_render_gpu_cancel_frame(r);
+        return false;
+    }
+    if (bReadback && (!r->readbackXfer || r->readbackCapacity < (Uint32)ullPackedSize)) {
+        if (r->readbackXfer)
+            SDL_ReleaseGPUTransferBuffer(r->device, r->readbackXfer);
+        SDL_GPUTransferBufferCreateInfo tbi = {
+            .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size  = (Uint32)ullPackedSize
+        };
+        r->readbackXfer = SDL_CreateGPUTransferBuffer(r->device, &tbi);
+        r->readbackCapacity = r->readbackXfer ? (Uint32)ullPackedSize : 0;
+        if (!r->readbackXfer) {
+            scene_render_gpu_cancel_frame(r);
+            return false;
+        }
+    }
     bool useMSAA = r->msaaSampleCount > SDL_GPU_SAMPLECOUNT_1;
     if (useMSAA) ensure_msaa_textures(r, renderW, renderH);
     if (useMSAA && (!r->msaaTex || !r->msaaDepthTex)) useMSAA = false;
@@ -3004,15 +3168,9 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
     r->texParticleUploadNs = tUpload - tParticleUpload;
     r->uploadNs = tUpload - tSortRepack;
 
-    if (!r->swapchainTex) {
-        SDL_SubmitGPUCommandBuffer(r->cmdBuf);
-        r->cmdBuf = NULL;
-        return;
-    }
-
-    /* Render to the offscreen target (falls back to swapchain if creation failed).
-     * With MSAA: msaaTex is the render target, offscreenTex is the resolve target. */
-    SDL_GPUTexture *resolveTarget = r->offscreenTex ? r->offscreenTex : r->swapchainTex;
+    /* Render to the selected offscreen target.  With MSAA, msaaTex is the
+     * render target and offscreenTex is the resolve target. */
+    SDL_GPUTexture *resolveTarget = r->offscreenTex;
 
     /* ====================================================================
      * Pass 1: 3D scene + car meshes → offscreen (with optional MSAA resolve)
@@ -3365,10 +3523,45 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
         SDL_EndGPURenderPass(hrp);
     }
 
+    /* Download the resolved scene itself, before presentation can add
+     * scaling, letterboxing, CRT processing, or swapchain colour conversion. */
+    if (bReadback) {
+        SDL_GPUCopyPass *pReadbackPass = SDL_BeginGPUCopyPass(r->cmdBuf);
+        if (!pReadbackPass) {
+            scene_render_gpu_cancel_frame(r);
+            return false;
+        }
+        SDL_GPUTextureRegion src = {
+            .texture = resolveTarget,
+            .w = (Uint32)renderW,
+            .h = (Uint32)renderH,
+            .d = 1
+        };
+        SDL_GPUTextureTransferInfo dst = {
+            .transfer_buffer = r->readbackXfer,
+            .pixels_per_row = (Uint32)renderW,
+            .rows_per_layer = (Uint32)renderH
+        };
+        SDL_DownloadFromGPUTexture(pReadbackPass, &src, &dst);
+        SDL_EndGPUCopyPass(pReadbackPass);
+    }
+
+    /* Swapchain acquisition belongs strictly to the presentation path.  The
+     * complete scene and HUD have already been recorded into offscreenTex, so
+     * editor readback never needs a window and game presentation cannot shape
+     * the scene pass itself. */
+    if (!bReadback && r->window) {
+        if (!ROLLERTryAcquireGPUSwapchainTexture(r->cmdBuf, r->window,
+                &r->swapchainTex, NULL, NULL) || !r->swapchainTex) {
+            scene_render_gpu_cancel_frame(r);
+            return false;
+        }
+    }
+
     /* ====================================================================
      * Blit/CRT offscreen → swapchain with letterbox/pillarbox
      * ==================================================================== */
-    if (r->offscreenTex) {
+    if (!bReadback && r->window && r->swapchainTex && r->offscreenTex) {
         int winW, winH;
         SDL_GetWindowSizeInPixels(r->window, &winW, &winH);
 
@@ -3403,7 +3596,7 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
         }
     }
 
-    if (r->debugOverlay && r->swapchainTex) {
+    if (!bReadback && r->debugOverlay && r->swapchainTex) {
         int winW, winH;
         SDL_GetWindowSizeInPixels(r->window, &winW, &winH);
         debug_overlay_render(r->debugOverlay, r->cmdBuf, r->swapchainTex,
@@ -3413,8 +3606,42 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
     Uint64 tHudPost = SDL_GetTicksNS();
     r->hudPostNs = tHudPost - tDraw;
 
-    SDL_SubmitGPUCommandBuffer(r->cmdBuf);
+    bool bFrameOk = true;
+    SDL_GPUFence *pFence = NULL;
+    if (bReadback) {
+        pFence = SDL_SubmitGPUCommandBufferAndAcquireFence(r->cmdBuf);
+        bFrameOk = pFence != NULL;
+        if (!pFence) {
+            SDL_Log("scene_render_gpu: readback command submission failed: %s",
+                    SDL_GetError());
+        }
+    } else {
+        bFrameOk = SDL_SubmitGPUCommandBuffer(r->cmdBuf);
+    }
     r->cmdBuf = NULL;
+
+    if (pFence) {
+        SDL_GPUFence *apFences[1] = { pFence };
+        if (!SDL_WaitForGPUFences(r->device, true, apFences, 1)) {
+            SDL_Log("scene_render_gpu: readback fence wait failed: %s",
+                    SDL_GetError());
+            bFrameOk = false;
+        } else {
+            const uint8 *pbyMapped = SDL_MapGPUTransferBuffer(r->device,
+                                                               r->readbackXfer,
+                                                               false);
+            if (!pbyMapped) {
+                SDL_Log("scene_render_gpu: readback transfer map failed: %s",
+                        SDL_GetError());
+                bFrameOk = false;
+            } else {
+                copy_readback_to_rgba(pbyPixels, uiRowPitch, pbyMapped,
+                                      renderW, renderH, r->colorTargetFormat);
+                SDL_UnmapGPUTransferBuffer(r->device, r->readbackXfer);
+            }
+        }
+        SDL_ReleaseGPUFence(r->device, pFence);
+    }
     r->submitNs = SDL_GetTicksNS() - tHudPost;
 
     /* Perf-investigation instrumentation (see g_bRenderStatsLog): draw-
@@ -3458,6 +3685,25 @@ void scene_render_gpu_end_frame(SceneRendererGPU *r)
                       + r->drawNs + r->hudPostNs + r->submitNs) / 1000000.0);
         }
     }
+    return bFrameOk;
+}
+
+bool scene_render_gpu_end_frame(SceneRendererGPU *r)
+{
+    return scene_render_gpu_end_frame_internal(r, NULL, 0, 0, 0, 0);
+}
+
+bool scene_render_gpu_end_frame_readback(SceneRendererGPU *r,
+                                         uint8 *pbyPixels,
+                                         Uint32 uiBufferSize,
+                                         Uint32 uiRowPitch,
+                                         Uint32 uiWidth,
+                                         Uint32 uiHeight)
+{
+    if (!pbyPixels) return false;
+    return scene_render_gpu_end_frame_internal(r, pbyPixels,
+                                                uiBufferSize, uiRowPitch,
+                                                uiWidth, uiHeight);
 }
 
 void scene_render_gpu_cancel_frame(SceneRendererGPU *r)
@@ -3496,6 +3742,13 @@ void scene_render_gpu_set_viewport(SceneRendererGPU *r, int x, int y, int w, int
     if (!r) return;
     r->viewportX = x; r->viewportY = y;
     r->viewportW = w; r->viewportH = h;
+}
+
+void scene_render_gpu_set_projection_reference_height(SceneRendererGPU *r,
+                                                       int height)
+{
+    if (!r) return;
+    r->projectionReferenceHeight = height > 0 ? height : 0;
 }
 
 void scene_render_gpu_set_camera(SceneRendererGPU *r, const SceneRenderCamera *cam)
@@ -4244,6 +4497,33 @@ void scene_render_gpu_free_texture(SceneRendererGPU *r, SceneTextureHandle handl
     memset(s, 0, sizeof(*s));
 }
 
+int scene_render_gpu_texture_slots_in_use(const SceneRendererGPU *r)
+{
+    int count = 0;
+
+    if (!r) return 0;
+    for (int i = 1; i < SCENE_GPU_MAX_TEXTURE_SLOTS; i++) {
+        if (r->texSlots[i].in_use) count++;
+    }
+    return count;
+}
+
+int scene_render_gpu_textures_resident(const SceneRendererGPU *r)
+{
+    int count = 0;
+
+    if (!r) return 0;
+    for (int i = 1; i < SCENE_GPU_MAX_TEXTURE_SLOTS; i++) {
+        const SceneGPUTextureSlot *s = &r->texSlots[i];
+        if (!s->in_use) continue;
+        for (int t = 0; t < s->numTiles; t++) {
+            if (s->tileTextures[t]) count++;
+            if (s->pairTextures[t]) count++;
+        }
+    }
+    return count;
+}
+
 SceneTextureHandle scene_render_gpu_get_texture_handle(const SceneRendererGPU *r, int tex_idx)
 {
     if (!r || tex_idx < 0 || tex_idx >= 32) return SCENE_TEXTURE_HANDLE_INVALID;
@@ -4469,7 +4749,7 @@ static bool scene_render_gpu_quad_frustum_culled(const SceneRendererGPU *r,
     float up_x    = r->proj.view[0][1], up_y    = r->proj.view[1][1], up_z    = r->proj.view[2][1];
     int   vpW = r->viewportW > 0 ? r->viewportW : 640;
     int   vpH = r->viewportH > 0 ? r->viewportH : 400;
-    float ss   = (float)r->proj.screenScale / 64.0f;
+    float ss   = effective_screen_scale(r, vpH);
     float fovX = (2.0f * r->camera.fovScale * r->fovMultiplier * ss) / (float)vpW;
     float fovY = (2.0f * r->camera.fovScale * r->fovMultiplier * ss) / (float)vpH;
 
@@ -5507,7 +5787,7 @@ void scene_render_gpu_quad_world_legacy(SceneRendererGPU *r,
             const float (*M)[3] = r->proj.view;
             int vpW = r->viewportW > 0 ? r->viewportW : 640;
             int vpH = r->viewportH > 0 ? r->viewportH : 400;
-            float ss   = (float)r->proj.screenScale / 64.0f;
+            float ss   = effective_screen_scale(r, vpH);
             float fovX = 2.0f * r->camera.fovScale * g_fFovMultiplier * ss / (float)vpW;
             float fovY = 2.0f * r->camera.fovScale * g_fFovMultiplier * ss / (float)vpH;
             /* Vertical center correction, matching build_mvp's shift_y exactly:

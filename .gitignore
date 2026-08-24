@@ -4,6 +4,7 @@
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
 # User-specific files
+.wrangler/
 *.rsuser
 *.suo
 *.user
@@ -77,6 +78,7 @@ StyleCopReport.xml
 *.ilk
 *.meta
 *.obj
+!tests/fixtures/f_s4a_reference.obj
 *.iobj
 *.pch
 *.pdb
@@ -400,3 +402,4 @@ packages.microsoft.gpg
 .codex
 CLAUDE.md
 .worktrees/
+.superpowers

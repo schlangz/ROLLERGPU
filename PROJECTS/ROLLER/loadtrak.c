@@ -11,6 +11,11 @@
 #include "transfrm.h"
 #include "view.h"
 #include "control.h"
+#include "editor_track_loader.h"
+#include "sound.h"
+#if defined(ROLLER_EDITOR_CORE)
+#include "roller_core_error.h"
+#endif
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
@@ -83,6 +88,7 @@ int cur_mapsect;            //00178044
 float cur_TrackZ;           //00178048
 float cur_mapsize;          //0017804C
 int TRAK_LEN;               //00178050
+float TrackFloorHeight;     // header origin Z; editor environment floor (E3A-S4)
 int16 samplemin[MAX_SAMPLES];       //001764B0
 int cur_laps[6];            //00176898
 uint8 fp_buf[512];          //001768B0
@@ -97,10 +103,20 @@ int g_iCommunityTrackSel = -1;
 int g_iCommunityTrackTop = 0;
 int g_iCommunityTrackMissing = 0;
 uint32 g_uiCommunityTrackCRC = 0;
-// Bumped on every loadtrack() call so caches of track-derived data (e.g. the
-// GPU menu preview mesh) can detect reloads even when the track index is
-// unchanged -- all community tracks share TRACK_LOAD_COMMUNITY.
+// Bumped only after a complete load so caches never accept partially loaded
+// or rejected track-derived data as a committed generation.
 int g_iTrackLoadGeneration = 0;
+/* Committed load mode for the current legacy scene. Normal game loads never
+ * enable it; the editor facade opts in through its dedicated staged seam. */
+static int s_bEditorTrackOnly;
+/*
+ * E3A-S6. The roots the last editor load resolved its assets against, kept so
+ * a later editor-only asset -- the test car's texture bank -- can follow the
+ * same document-first order (E1-S4) instead of falling back to the process
+ * working directory, which is not the editor's document.
+ */
+static char s_szEditorDocumentAssetRoot[ROLLER_MAX_PATH];
+static char s_szEditorFallbackAssetRoot[ROLLER_MAX_PATH];
 static char g_szCommunityTrackDir[16] = "../TRACKS";
 static int g_iStockTrackAvailabilityScanned = 0;
 static uint32 g_uiStockTrackAvailabilityMask = 0;
@@ -431,8 +447,238 @@ uint32 community_track_crc(const char *szPath)
 }
 
 //-------------------------------------------------------------------------------------------------
+static int track_path_is_absolute(const char *szPath)
+{
+  if (!szPath || !szPath[0])
+    return 0;
+  if (szPath[0] == '/')
+    return -1;
+  if ((szPath[0] == '\\' && szPath[1] == '\\') ||
+      (((szPath[0] >= 'A' && szPath[0] <= 'Z') ||
+        (szPath[0] >= 'a' && szPath[0] <= 'z')) &&
+       szPath[1] == ':' && (szPath[2] == '\\' || szPath[2] == '/')))
+    return -1;
+  return 0;
+}
+
+static uint64 community_track_state_hash(void)
+{
+  const uint64 ullOffsetBasis = UINT64_C(14695981039346656037);
+  const uint64 ullPrime = UINT64_C(1099511628211);
+  uint64 ullHash = ullOffsetBasis;
+#define HASH_STATE_BYTES(value) do { \
+    const uint8 *pbyHashData = (const uint8 *)&(value); \
+    for (size_t uiHashByte = 0; uiHashByte < sizeof(value); uiHashByte++) { \
+      ullHash ^= pbyHashData[uiHashByte]; \
+      ullHash *= ullPrime; \
+    } \
+  } while (0)
+  HASH_STATE_BYTES(g_aszCommunityTracks);
+  HASH_STATE_BYTES(g_iCommunityTrackCount);
+  HASH_STATE_BYTES(g_iCommunityTrackSel);
+  HASH_STATE_BYTES(g_iCommunityTrackTop);
+  HASH_STATE_BYTES(g_iCommunityTrackMissing);
+  HASH_STATE_BYTES(g_uiCommunityTrackCRC);
+  HASH_STATE_BYTES(g_szCommunityTrackDir);
+#undef HASH_STATE_BYTES
+  return ullHash;
+}
+
+static void loadtrack_set_error(char *szError, size_t uiErrorCapacity,
+                                const char *szFormat, ...)
+{
+  va_list Args;
+
+  if (!szError || uiErrorCapacity == 0)
+    return;
+  va_start(Args, szFormat);
+  vsnprintf(szError, uiErrorCapacity, szFormat, Args);
+  va_end(Args);
+  szError[uiErrorCapacity - 1u] = '\0';
+}
+
+static eRollerEdResult loadtrack_stage_result(eEdTrackLoadResult eResult)
+{
+  switch (eResult) {
+    case ED_TRACK_LOAD_OK:
+      return ROLLER_ED_RESULT_OK;
+    case ED_TRACK_LOAD_INVALID_ARGUMENT:
+      return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+    case ED_TRACK_LOAD_IO_FAILED:
+      return ROLLER_ED_RESULT_IO_FAILED;
+    case ED_TRACK_LOAD_OUT_OF_MEMORY:
+      return ROLLER_ED_RESULT_OUT_OF_MEMORY;
+    case ED_TRACK_LOAD_TRUNCATED:
+    case ED_TRACK_LOAD_INVALID_SIZE:
+    case ED_TRACK_LOAD_INVALID_BACK_REFERENCE:
+    case ED_TRACK_LOAD_OUTPUT_OVERFLOW:
+    case ED_TRACK_LOAD_MALFORMED_TEXT:
+      return ROLLER_ED_RESULT_LOAD_FAILED;
+  }
+  return ROLLER_ED_RESULT_INTERNAL_ERROR;
+}
+
+static int loadtrack_join_asset_path(
+    char szPath[ROLLER_MAX_PATH], const char *szRoot, const char *szAsset)
+{
+  size_t uiRootLength;
+  int iLength;
+  char chSeparator;
+
+  if (!szPath || !szRoot || !szRoot[0] || !szAsset || !szAsset[0])
+    return 0;
+  uiRootLength = strlen(szRoot);
+  chSeparator = (uiRootLength > 0
+      && (szRoot[uiRootLength - 1u] == '/'
+          || szRoot[uiRootLength - 1u] == '\\')) ? '\0' : '/';
+  iLength = chSeparator
+    ? snprintf(szPath, ROLLER_MAX_PATH, "%s%c%s",
+               szRoot, chSeparator, szAsset)
+    : snprintf(szPath, ROLLER_MAX_PATH, "%s%s", szRoot, szAsset);
+  return iLength > 0 && iLength < ROLLER_MAX_PATH;
+}
+
+static int loadtrack_copy_existing_path(
+    char szResolved[ROLLER_MAX_PATH], const char *szCandidate)
+{
+  const char *szCaseResolved;
+  size_t uiLength;
+
+  if (!szCandidate || !ROLLERfexists(szCandidate))
+    return 0;
+  szCaseResolved = ROLLERfindpath(szCandidate);
+  if (!szCaseResolved)
+    szCaseResolved = szCandidate;
+  uiLength = strlen(szCaseResolved);
+  if (uiLength >= ROLLER_MAX_PATH)
+    return 0;
+  memcpy(szResolved, szCaseResolved, uiLength + 1u);
+  return -1;
+}
+
+static eRollerEdResult loadtrack_resolve_document_asset(
+    const char *szAsset,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    char szResolved[ROLLER_MAX_PATH],
+    char *szError,
+    size_t uiErrorCapacity)
+{
+  char szCandidate[ROLLER_MAX_PATH];
+
+  if (szDocumentAssetRoot && szFallbackAssetRoot) {
+    if (!loadtrack_join_asset_path(
+            szCandidate, szDocumentAssetRoot, szAsset)) {
+      loadtrack_set_error(szError, uiErrorCapacity,
+                          "document asset path is too long for '%s'", szAsset);
+      return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+    }
+    if (loadtrack_copy_existing_path(szResolved, szCandidate))
+      return ROLLER_ED_RESULT_OK;
+
+    if (!loadtrack_join_asset_path(
+            szCandidate, szFallbackAssetRoot, szAsset)) {
+      loadtrack_set_error(szError, uiErrorCapacity,
+                          "fallback asset path is too long for '%s'", szAsset);
+      return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+    }
+    if (loadtrack_copy_existing_path(szResolved, szCandidate))
+      return ROLLER_ED_RESULT_OK;
+
+    loadtrack_set_error(
+        szError, uiErrorCapacity,
+        "asset '%s' was not found in document root '%s' or fallback root '%s'",
+        szAsset, szDocumentAssetRoot, szFallbackAssetRoot);
+    return ROLLER_ED_RESULT_IO_FAILED;
+  }
+
+  if (loadtrack_copy_existing_path(szResolved, szAsset))
+    return ROLLER_ED_RESULT_OK;
+  loadtrack_set_error(szError, uiErrorCapacity,
+                      "track asset '%s' was not found", szAsset);
+  return ROLLER_ED_RESULT_IO_FAILED;
+}
+
+/* Normal game loads keep the working directory at FATDATA.  Community
+ * tracks live beside their authored TEX/BLD files, so resolve those names
+ * relative to the TRK first and then let the bare-name lookup reach FATDATA.
+ * Direct/editor loads use the explicit document/fallback path above. */
+static int loadtrack_resolve_track_asset(
+    const char *szTrackPath, const char *szAsset,
+    char szResolved[ROLLER_MAX_PATH])
+{
+  char szTrackDirectory[ROLLER_MAX_PATH];
+  const char *szSlash;
+  size_t uiDirectoryLength;
+  char szCandidate[ROLLER_MAX_PATH];
+
+  if (!szTrackPath || !szTrackPath[0] || !szAsset || !szAsset[0]
+      || !szResolved)
+    return 0;
+
+  szSlash = strrchr(szTrackPath, '/');
+  {
+    const char *szBackslash = strrchr(szTrackPath, '\\');
+    if (!szSlash || (szBackslash && szBackslash > szSlash))
+      szSlash = szBackslash;
+  }
+  if (szSlash) {
+    uiDirectoryLength = (size_t)(szSlash - szTrackPath);
+    if (uiDirectoryLength == 0u)
+      uiDirectoryLength = 1u;
+    if (uiDirectoryLength >= sizeof(szTrackDirectory))
+      return 0;
+    memcpy(szTrackDirectory, szTrackPath, uiDirectoryLength);
+    szTrackDirectory[uiDirectoryLength] = '\0';
+  } else {
+    snprintf(szTrackDirectory, sizeof(szTrackDirectory), ".");
+  }
+
+  if (loadtrack_join_asset_path(
+          szCandidate, szTrackDirectory, szAsset)
+      && loadtrack_copy_existing_path(szResolved, szCandidate))
+    return -1;
+  return loadtrack_copy_existing_path(szResolved, szAsset);
+}
+
+static eRollerEdResult loadtrack_validate_palette(
+    const char *szPalettePath, char *szError, size_t uiErrorCapacity)
+{
+  FILE *pPalette = ROLLERfopen(szPalettePath, "rb");
+  long lLength;
+
+  if (!pPalette) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "palette asset could not be opened: %s", szPalettePath);
+    return ROLLER_ED_RESULT_IO_FAILED;
+  }
+  if (fseek(pPalette, 0, SEEK_END) != 0) {
+    fclose(pPalette);
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "palette asset length could not be read: %s",
+                        szPalettePath);
+    return ROLLER_ED_RESULT_IO_FAILED;
+  }
+  lLength = ftell(pPalette);
+  fclose(pPalette);
+  if (lLength != 256L * 3L) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "palette asset '%s' has length %ld; expected 768 bytes",
+                        szPalettePath, lLength);
+    return ROLLER_ED_RESULT_LOAD_FAILED;
+  }
+  return ROLLER_ED_RESULT_OK;
+}
+
 //0004AF80
-void loadtrack(int iTrackIdx, int iPreviewMode)
+static eRollerEdResult loadtrack_internal(
+    int iTrackIdx, int iPreviewMode,
+    const char *szDirectTrackPath,
+    const tEdTrackStage *pDirectStage,
+    const char *szDirectTexturePath,
+    const char *szDirectBuildingTexturePath,
+    int bEditorTrackOnly,
+    char *szError, size_t uiErrorCapacity)
 {
   int iCarIdx; // ecx
   tCar *pCar; // edi
@@ -580,8 +826,15 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
   int *pTowerBasePtr; // [esp+270h] [ebp-1Ch]
   unsigned int uiGroundPtOffset; // [esp+274h] [ebp-18h]
   const char *szTrackFile; // [ROLLER]
+  int bDirectPath = szDirectTrackPath != NULL;
 
-  ++g_iTrackLoadGeneration;
+#if defined(ROLLER_EDITOR_CORE)
+  roller_core_error_clear();
+#endif
+  /* This must precede every car-sized initialization in the loader. Merely
+   * skipping DrawCars would still create simulated gameplay cars. */
+  if (bEditorTrackOnly)
+    numcars = 0;
   iTrackIdx_1 = iTrackIdx;                      // Initialize variables and clear car structures
   bMinimalMode = iPreviewMode;
   p_iBuildingBase = BuildingBase[0];
@@ -589,43 +842,78 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
   pTowerBasePtr = (int *)TowerBase;
   iCompactedFlag = 0;
   pData = 0;
-  NumBuildings = 0;
-  NumTowers = 0;
-  iCarIdx = 0;
-  if (numcars > 0) {
-    pCar = Car;
-    do {
-      memset(pCar, 0, sizeof(tCar));
-      ++iCarIdx;
-      ++pCar;
-    } while (iCarIdx < numcars);
-  }
   pFile_2 = 0;
   szTrackFile = NULL;
-  if (iTrackIdx_1 == TRACK_LOAD_COMMUNITY) {
+  if (bDirectPath) {
+    szTrackFile = szDirectTrackPath;
+  } else if (iTrackIdx_1 == TRACK_LOAD_COMMUNITY) {
     szTrackFile = community_track_path();
     if (!szTrackFile) {
       g_iCommunityTrackSel = -1;
       g_uiCommunityTrackCRC = 0;
-      return;
+      loadtrack_set_error(szError, uiErrorCapacity,
+                          "selected community track is unavailable");
+      return ROLLER_ED_RESULT_IO_FAILED;
     }
   } else if ((unsigned int)iTrackIdx_1 <= 0x18) {
     szTrackFile = names[iTrackIdx_1];
   }
+  if (!szTrackFile) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "track index %d is invalid", iTrackIdx_1);
+    return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+  }
   if (szTrackFile) {
-    pFile = ROLLERfopen(szTrackFile, "r");     // Open and validate track file
+    pFile = ROLLERfopen(szTrackFile, "rb");     // Open and validate track file
     if (!pFile) {
+      if (bDirectPath) {
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "unable to open track file: %s", szTrackFile);
+        return ROLLER_ED_RESULT_IO_FAILED;
+      }
       if (iTrackIdx_1 == TRACK_LOAD_COMMUNITY) {
         g_iCommunityTrackSel = -1;
         g_uiCommunityTrackCRC = 0;
-        return;
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "selected community track is unavailable");
+        return ROLLER_ED_RESULT_IO_FAILED;
       }
-      ErrorBoxExit("Track %d not found\n", iTrackIdx_1);
-      //__asm { int     10h; -VIDEO - SET VIDEO MODE }
-      //printf("Track %d not found\n", iTrackIdx_1);
-      //doexit();
+      loadtrack_set_error(szError, uiErrorCapacity,
+                          "track %d was not found", iTrackIdx_1);
+      return ROLLER_ED_RESULT_IO_FAILED;
     }
     fclose(pFile);
+    if (pDirectStage) {
+      iCompactedFileLength = (int)pDirectStage->uiDataLength;
+      if (bMinimalMode
+          && pDirectStage->uiDataLength + 1u > SCRBUF_MAX_PIXELS) {
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "track data exceeds the preview buffer");
+        return ROLLER_ED_RESULT_LOAD_FAILED;
+      }
+      pTrackBuffer = bMinimalMode
+        ? scrbuf
+        : (uint8 *)trybuffer((uint32)iCompactedFileLength + 1u);
+      if (!pTrackBuffer) {
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "track buffer allocation failed");
+        return ROLLER_ED_RESULT_OUT_OF_MEMORY;
+      }
+      pData = pTrackBuffer;
+      pCurrDataPtr = pTrackBuffer;
+      memcpy(pTrackBuffer, pDirectStage->pbyData,
+             pDirectStage->uiDataLength);
+      pData[iCompactedFileLength] = 26;
+      pFile_2 = ROLLERfopen(szTrackFile, "rb");
+      if (!pFile_2) {
+        if (!bMinimalMode)
+          fre((void **)&pData);
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "unable to reopen track file: %s", szTrackFile);
+        return ROLLER_ED_RESULT_IO_FAILED;
+      }
+      iCompactedFlag = -1;
+    } else {
     iCompactedFileLength = getcompactedfilelength(szTrackFile);
     if ((int16)iCompactedFileLength == 8224)// Check if file is compacted (magic number 8224)
     {
@@ -656,10 +944,26 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
       pFile_2 = pFile_1;
       iCompactedFlag = -1;
     }
+    }
+  }
+  NumBuildings = 0;
+  NumTowers = 0;
+  iCarIdx = 0;
+  if (numcars > 0) {
+    pCar = Car;
+    do {
+      memset(pCar, 0, sizeof(tCar));
+      ++iCarIdx;
+      ++pCar;
+    } while (iCarIdx < numcars);
   }
   meof = 0;
   if (iTrackIdx_1 >= 0)
     readline2(&pCurrDataPtr, "iddd", &TRAK_LEN, &dWallCalc3, &dWallCalc2, &dWallCalc1);// Read track header: length and initial position
+    // The origin's up component doubles as the track's floor height: every
+    // point below is offset by it, and the editor's environment-floor helper
+    // (E3A-S4) draws a plane there. The game has no use for it after load.
+    TrackFloorHeight = (float)dWallCalc1;
   iChunkIdx = 0;
   TrackFlags = 0;
   if (TRAK_LEN > 0) {
@@ -928,7 +1232,7 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
           ++NumBuildings;
           p_fBuildingAnglesBase = p_fBuildingAngles + 2;
           p_fBuildingAngles[1] = (float)iSignRoll;
-        } else {
+        } else if (NumTowers < MAX_TOWERS) {
           *pTowerBasePtr++ = iChunkIdx;
           pTowerBase = pTowerBasePtr;
           *pTowerBasePtr = iSignHOffset;
@@ -1260,31 +1564,51 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
     initlocaltrack();                           // Initialize track objects and car placement
     InitTowers();
     InitBuildings();
-    placecars();
+    if (!bEditorTrackOnly)
+      placecars();
     if (iTrackIdx_1 >= 0) {
       start_f = pCurrDataPtr;                   // Read additional track data: stunts, textures, buildings
       readstuntdata(&pCurrDataPtr);
       read_texturemap(&pCurrDataPtr);
       read_bldmap(&pCurrDataPtr);
+      if (!szDirectTexturePath)
+        loadtrack_resolve_track_asset(szTrackFile, texture_file, texture_file);
+      if (!szDirectBuildingTexturePath)
+        loadtrack_resolve_track_asset(
+            szTrackFile, bldtex_file, bldtex_file);
+      if (szDirectTexturePath) {
+        strncpy(texture_file, szDirectTexturePath, sizeof(texture_file) - 1u);
+        texture_file[sizeof(texture_file) - 1u] = '\0';
+      }
+      if (szDirectBuildingTexturePath) {
+        strncpy(bldtex_file, szDirectBuildingTexturePath,
+                sizeof(bldtex_file) - 1u);
+        bldtex_file[sizeof(bldtex_file) - 1u] = '\0';
+      }
       read_backs(&pCurrDataPtr);
     }
-    if (Play_View == 1)
-      testteaminit(&Car[ViewType[0]]);
-    else
-      initcarview(ViewType[0], 0);
-    if (player_type == 2)
-      initcarview(ViewType[1], 1);
+    if (!bEditorTrackOnly) {
+      if (Play_View == 1)
+        testteaminit(&Car[ViewType[0]]);
+      else
+        initcarview(ViewType[0], 0);
+      if (player_type == 2)
+        initcarview(ViewType[1], 1);
+    }
     initpits();
   }
   if (iTrackIdx_1 >= 0) {
     readline2(&pCurrDataPtr, "i", &actualtrack);// Read actual track ID and validate against requested
     if (iCompactedFlag && replaytype != 2 &&
-        iTrackIdx_1 != TRACK_LOAD_COMMUNITY &&
+        !bDirectPath && iTrackIdx_1 != TRACK_LOAD_COMMUNITY &&
         iTrackIdx_1 != actualtrack && !bMinimalMode) {
-      ErrorBoxExit("Cheat!!!! Track %d is really track %d!!!\n", iTrackIdx_1, actualtrack);
-      //__asm { int     10h; -VIDEO - SET VIDEO MODE }
-      //printf("Cheat!!!! Track %d is really track %d!!!\n", iTrackIdx_1, actualtrack);
-      //doexit();
+      loadtrack_set_error(szError, uiErrorCapacity,
+                          "Cheat!!!! Track %d is really track %d!!!\n",
+                          iTrackIdx_1, actualtrack);
+      fclose(pFile_2);
+      if (!bMinimalMode && pData)
+        fre((void **)&pData);
+      return ROLLER_ED_RESULT_LOAD_FAILED;
     }
     cur_laps[0] = 0;                            // Initialize lap counters
     if (!meof) {
@@ -1315,8 +1639,255 @@ void loadtrack(int iTrackIdx, int iPreviewMode)
       activatestunts();
       LoadBldTextures();
       LoadTextures();
+#if defined(ROLLER_EDITOR_CORE)
+      if (roller_core_error_pending()) {
+        loadtrack_set_error(szError, uiErrorCapacity, "%s",
+                            roller_core_error_message());
+        return ROLLER_ED_RESULT_IO_FAILED;
+      }
+#endif
     }
   }
+  s_bEditorTrackOnly = bEditorTrackOnly;
+  ++g_iTrackLoadGeneration;
+  loadtrack_set_error(szError, uiErrorCapacity, "");
+  return ROLLER_ED_RESULT_OK;
+}
+
+eRollerEdResult loadtrack(int iTrackIdx, int iPreviewMode)
+{
+  char szError[256];
+  eRollerEdResult eResult = loadtrack_internal(
+    iTrackIdx, iPreviewMode, NULL, NULL, NULL, NULL, 0,
+    szError, sizeof(szError));
+
+#if !defined(ROLLER_EDITOR_CORE)
+  if (eResult != ROLLER_ED_RESULT_OK)
+    ErrorBoxExit("%s", szError[0] ? szError : "track load failed");
+#endif
+  return eResult;
+}
+
+eRollerEdResult loadtrack_from_path_with_assets_ex(
+    const char *szTrackPath,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError, size_t uiErrorCapacity)
+{
+  tEdTrackStage TrackStage;
+  char szStageError[256];
+  eEdTrackLoadResult eStageResult;
+  eRollerEdResult eResult;
+
+  ed_track_stage_init(&TrackStage);
+  if (!track_path_is_absolute(szTrackPath)) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "track path must be absolute");
+    return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+  }
+  eStageResult = ed_track_file_stage(
+    szTrackPath, &TrackStage, szStageError, sizeof(szStageError));
+  if (eStageResult != ED_TRACK_LOAD_OK) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "track staging failed: %s", szStageError);
+    return loadtrack_stage_result(eStageResult);
+  }
+  eResult = loadtrack_from_stage_with_assets_ex(
+    szTrackPath, &TrackStage, szDocumentAssetRoot, szFallbackAssetRoot,
+    iPreviewMode,
+    szError, uiErrorCapacity);
+  ed_track_stage_dispose(&TrackStage);
+  return eResult;
+}
+
+eRollerEdResult loadtrack_from_path_ex(
+    const char *szTrackPath, int iPreviewMode,
+    char *szError, size_t uiErrorCapacity)
+{
+  return loadtrack_from_path_with_assets_ex(
+    szTrackPath, NULL, NULL, iPreviewMode, szError, uiErrorCapacity);
+}
+
+static eRollerEdResult loadtrack_from_stage_with_assets_mode_ex(
+    const char *szTrackPath,
+    const tEdTrackStage *pTrackStage,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    int bEditorTrackOnly,
+    char *szError,
+    size_t uiErrorCapacity)
+{
+  tEdTrackStage AssetStage;
+  char szStageError[256];
+  char szTexturePath[ROLLER_MAX_PATH];
+  char szBuildingTexturePath[ROLLER_MAX_PATH];
+  char szPalettePath[ROLLER_MAX_PATH];
+  const char *szTextureOverride = NULL;
+  const char *szBuildingOverride = NULL;
+  uint64 ullCommunityStateBefore;
+  int iGenerationBefore;
+  eEdTrackLoadResult eStageResult;
+  eRollerEdResult eResult;
+
+  if (!track_path_is_absolute(szTrackPath)) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "track path must be absolute");
+    return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+  }
+  if (!pTrackStage || !pTrackStage->pbyData
+      || pTrackStage->uiDataLength == 0u) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "a validated track stage is required");
+    return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+  }
+  if ((szDocumentAssetRoot == NULL) != (szFallbackAssetRoot == NULL)
+      || (szDocumentAssetRoot && (!szDocumentAssetRoot[0]
+                                  || !szFallbackAssetRoot[0]))) {
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "both document and fallback asset roots are required");
+    return ROLLER_ED_RESULT_INVALID_ARGUMENT;
+  }
+
+  /* Remembered before the first resolve so the editor's own later assets see
+   * exactly the roots this load used, whether or not it succeeds. */
+  if (szDocumentAssetRoot && szFallbackAssetRoot) {
+    snprintf(s_szEditorDocumentAssetRoot,
+             sizeof(s_szEditorDocumentAssetRoot), "%s", szDocumentAssetRoot);
+    snprintf(s_szEditorFallbackAssetRoot,
+             sizeof(s_szEditorFallbackAssetRoot), "%s", szFallbackAssetRoot);
+  }
+
+  ed_track_stage_init(&AssetStage);
+  if (!iPreviewMode) {
+    const char *aszAssets[2] = {
+      pTrackStage->szTextureFile,
+      pTrackStage->szBuildingTextureFile
+    };
+    char *aszResolved[2] = { szTexturePath, szBuildingTexturePath };
+
+    for (size_t iAsset = 0; iAsset < 2; iAsset++) {
+      eResult = loadtrack_resolve_document_asset(
+        aszAssets[iAsset], szDocumentAssetRoot, szFallbackAssetRoot,
+        aszResolved[iAsset], szError, uiErrorCapacity);
+      if (eResult != ROLLER_ED_RESULT_OK)
+        return eResult;
+      eStageResult = ed_compacted_file_stage(
+        aszResolved[iAsset], &AssetStage,
+        szStageError, sizeof(szStageError));
+      if (eStageResult != ED_TRACK_LOAD_OK) {
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "track asset '%s' at '%s' failed staging: %s",
+                            aszAssets[iAsset], aszResolved[iAsset], szStageError);
+        ed_track_stage_dispose(&AssetStage);
+        return loadtrack_stage_result(eStageResult);
+      }
+      ed_track_stage_dispose(&AssetStage);
+    }
+    szTextureOverride = szTexturePath;
+    szBuildingOverride = szBuildingTexturePath;
+
+    if (szDocumentAssetRoot) {
+      eResult = loadtrack_resolve_document_asset(
+        "PALETTE.PAL", szDocumentAssetRoot, szFallbackAssetRoot,
+        szPalettePath, szError, uiErrorCapacity);
+      if (eResult != ROLLER_ED_RESULT_OK)
+        return eResult;
+      eResult = loadtrack_validate_palette(
+        szPalettePath, szError, uiErrorCapacity);
+      if (eResult != ROLLER_ED_RESULT_OK)
+        return eResult;
+      if (!setpal(szPalettePath)) {
+        loadtrack_set_error(szError, uiErrorCapacity,
+                            "palette asset failed loading: %s", szPalettePath);
+        return ROLLER_ED_RESULT_IO_FAILED;
+      }
+    }
+  }
+
+  ullCommunityStateBefore = community_track_state_hash();
+  iGenerationBefore = g_iTrackLoadGeneration;
+  eResult = loadtrack_internal(
+    TRACK_LOAD_COMMUNITY, iPreviewMode, szTrackPath, pTrackStage,
+    szTextureOverride, szBuildingOverride, bEditorTrackOnly,
+    szError, uiErrorCapacity);
+  if (community_track_state_hash() != ullCommunityStateBefore) {
+    g_iTrackLoadGeneration = iGenerationBefore;
+    loadtrack_set_error(szError, uiErrorCapacity,
+                        "direct load changed community-track selection state");
+    return ROLLER_ED_RESULT_INTERNAL_ERROR;
+  }
+  return eResult;
+}
+
+eRollerEdResult loadtrack_from_stage_with_assets_ex(
+    const char *szTrackPath,
+    const tEdTrackStage *pTrackStage,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError,
+    size_t uiErrorCapacity)
+{
+  return loadtrack_from_stage_with_assets_mode_ex(
+    szTrackPath, pTrackStage, szDocumentAssetRoot, szFallbackAssetRoot,
+    iPreviewMode, 0, szError, uiErrorCapacity);
+}
+
+eRollerEdResult loadtrack_from_stage_with_assets_editor_ex(
+    const char *szTrackPath,
+    const tEdTrackStage *pTrackStage,
+    const char *szDocumentAssetRoot,
+    const char *szFallbackAssetRoot,
+    int iPreviewMode,
+    char *szError,
+    size_t uiErrorCapacity)
+{
+  return loadtrack_from_stage_with_assets_mode_ex(
+    szTrackPath, pTrackStage, szDocumentAssetRoot, szFallbackAssetRoot,
+    iPreviewMode, -1, szError, uiErrorCapacity);
+}
+
+int roller_ed_track_only_active(void)
+{
+  return s_bEditorTrackOnly;
+}
+
+int loadtrack_resolve_editor_asset(const char *szAsset,
+                                   char szResolved[ROLLER_MAX_PATH])
+{
+  char szCandidate[ROLLER_MAX_PATH];
+
+  if (!szAsset || !szAsset[0] || !szResolved)
+    return 0;
+  /* Document root first, then the configured FATDATA root -- the same order
+   * and the same reason as every other editor asset (E1-S4). */
+  if (s_szEditorDocumentAssetRoot[0]
+      && loadtrack_join_asset_path(szCandidate, s_szEditorDocumentAssetRoot,
+                                   szAsset)
+      && loadtrack_copy_existing_path(szResolved, szCandidate))
+    return -1;
+  if (s_szEditorFallbackAssetRoot[0]
+      && loadtrack_join_asset_path(szCandidate, s_szEditorFallbackAssetRoot,
+                                   szAsset)
+      && loadtrack_copy_existing_path(szResolved, szCandidate))
+    return -1;
+  /* No editor roots recorded: this is the game, where the working directory
+   * is the data directory and the bare name is already right. */
+  return loadtrack_copy_existing_path(szResolved, szAsset);
+}
+
+eRollerEdResult loadtrack_from_path(const char *szTrackPath, int iPreviewMode)
+{
+  char szError[256];
+  eRollerEdResult eResult = loadtrack_from_path_ex(
+    szTrackPath, iPreviewMode, szError, sizeof(szError));
+
+  if (eResult != ROLLER_ED_RESULT_OK)
+    fprintf(stderr, "Direct track load rejected '%s': %s\n",
+            szTrackPath ? szTrackPath : "(null)", szError);
+  return eResult;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1421,7 +1992,7 @@ void read_bldmap(uint8 **ppTrackData)
     } while (*pszFilenamePtr != 13 && *pszFilenamePtr != 10);
     bldtex_file[iIndex] = 0;                    // Null-terminate the building texture filename
   } else {
-    strcpy((char *)fp_buf, "building.drh");     // Use default building texture if no BLD entry found
+    strcpy(bldtex_file, "building.drh");       // Use default building texture if no BLD entry found
   }
   *ppTrackData = pbyOriginalTrackData;          // Restore original track data pointer
 }
@@ -1713,6 +2284,15 @@ uint8 *memgets(uint8 *pDst, uint8 **ppSrc)
       ++pDst2;
     } while (*(ppSrcNext - 1) > 13u && !iEof);
   } while (*pDst <= 13u);
+  /*
+   * E1-S9. The original routine copies the line's terminator byte and stops,
+   * leaving the destination with no NUL at all. Every strtok() in readline2
+   * then scanned past the end of the line into uninitialised stack -- which is
+   * what the Valgrind soak reported 22,478 times across 86 contexts, all of
+   * them here. Terminate *after* the CR/LF rather than over it: read_texturemap
+   * scans forward for the 13/10 itself and would run off the end without it.
+   */
+  *pDst2 = '\0';
   meof = iEof;
   return pDst2;
 }

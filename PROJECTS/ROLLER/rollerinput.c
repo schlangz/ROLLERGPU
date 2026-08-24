@@ -1,6 +1,7 @@
 #include "rollerinput.h"
 #include "3d.h"
-#if defined(IS_ANDROID)
+#include "phone_ui.h"
+#if defined(IS_ANDROID) || defined(IS_WASM)
 #include "frontend.h"
 #include "touch_ui.h"
 #endif
@@ -15,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(IS_ANDROID)
+#include <jni.h>
+#include <SDL3/SDL_system.h>
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <mmsystem.h>
@@ -30,7 +35,7 @@
 #define INPUT_MENU_AXIS_DEADZONE 12000
 #define INPUT_MENU_REPEAT_INITIAL_MS 280
 #define INPUT_MENU_REPEAT_MS 90
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 #define INPUT_PHONE_MAX_TOUCHES 8
 #define INPUT_PHONE_STEERING_MAX 0x102
 #define INPUT_PHONE_TILT_DEADZONE 0.25f
@@ -69,7 +74,7 @@ typedef struct
   uint64 ullNextRepeatMs;
 } tInputMenuKeyState;
 
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 typedef struct
 {
   SDL_FingerID ullFingerId;
@@ -86,7 +91,10 @@ typedef struct
 
 tInputBinding g_inputBindings[INPUT_NUM_ACTIONS];
 ePhoneControls g_ePhoneControls = PHONE_CONTROLS_TILT_TURN;
-bool g_bShowActiveTouchControls = false;
+bool g_bShowActiveTouchControls = true;
+#if defined(IS_ANDROID)
+bool g_bForceLandscape = true;
+#endif
 
 static tInputDevice *s_pDevices = NULL;
 static int s_iNumDevices = 0;
@@ -124,12 +132,17 @@ static uint64 s_ullNextWinMMRefreshMs = 0;
 static bool s_bRefreshingDevices = false;
 static eInputWindowsBackend s_eWindowsBackend = INPUT_WINDOWS_BACKEND_SDL_DINPUT;
 #endif
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 static tInputPhoneTouch s_aPhoneTouches[INPUT_PHONE_MAX_TOUCHES];
-static SDL_Sensor *s_pPhoneAccelSensor = NULL;
-static int s_iPhoneAccelOpenTried = 0;
 static float s_afPhoneAccel[3] = { 0.0f, 0.0f, 0.0f };
 static int s_iPhoneAccelValid = 0;
+#if defined(IS_WASM)
+static int s_iPhoneControlsOverride = -1;
+#endif
+#if defined(IS_ANDROID)
+static SDL_Sensor *s_pPhoneAccelSensor = NULL;
+static int s_iPhoneAccelOpenTried = 0;
+#endif
 #endif
 
 static const tInputActionInfo s_actionInfo[INPUT_NUM_ACTIONS] = {
@@ -165,15 +178,17 @@ static void InputMenuResetKeyStates(void);
 #if defined(IS_WASM)
 static void InputApplyPendingDefaultGamepadBindings(void);
 #endif
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 static void InputPhoneResetTouches(void);
 static void InputPhoneHandleTouchEvent(const SDL_Event *pEvent);
-static void InputPhoneUpdateSensor(void);
 static void InputPhoneShutdown(void);
 static int InputParsePhoneControlsSetting(const char *szValue);
 static int InputPhoneTouchInTurnRegion(const tInputPhoneTouch *pTouch,
                                        int iRightRegion);
 static int InputPhoneTouchInBrakeRegion(const tInputPhoneTouch *pTouch);
+#if defined(IS_ANDROID)
+static void InputPhoneUpdateSensor(void);
+#endif
 #endif
 
 //-------------------------------------------------------------------------------------------------
@@ -189,7 +204,7 @@ static int InputClampInt(int iValue, int iMin, int iMax)
 
 //-------------------------------------------------------------------------------------------------
 
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 static float InputPhoneAbsFloat(float fValue)
 {
   return fValue < 0.0f ? -fValue : fValue;
@@ -303,6 +318,7 @@ static void InputPhoneHandleTouchEvent(const SDL_Event *pEvent)
 
 //-------------------------------------------------------------------------------------------------
 
+#if defined(IS_ANDROID)
 static void InputPhoneCloseSensor(void)
 {
   if (s_pPhoneAccelSensor) {
@@ -362,14 +378,58 @@ static void InputPhoneUpdateSensor(void)
 }
 
 //-------------------------------------------------------------------------------------------------
+#endif
+
+//-------------------------------------------------------------------------------------------------
 
 static void InputPhoneShutdown(void)
 {
+#if defined(IS_ANDROID)
   InputPhoneCloseSensor();
+#endif
   InputPhoneResetTouches();
+  s_iPhoneAccelValid = 0;
 }
 
 //-------------------------------------------------------------------------------------------------
+
+#if defined(IS_WASM)
+void InputPhoneSetWebAccel(float fX, float fY, float fZ)
+{
+  s_afPhoneAccel[0] = fX;
+  s_afPhoneAccel[1] = fY;
+  s_afPhoneAccel[2] = fZ;
+  s_iPhoneAccelValid = -1;
+}
+
+//-------------------------------------------------------------------------------------------------
+
+void InputPhoneSetWebControls(ePhoneControls eControls)
+{
+  g_ePhoneControls = eControls;
+  s_iPhoneControlsOverride = (int)eControls;
+  if (eControls != PHONE_CONTROLS_TILT_TURN)
+    s_iPhoneAccelValid = 0;
+}
+
+//-------------------------------------------------------------------------------------------------
+
+int InputPhoneGetControls(void)
+{
+  return (int)g_ePhoneControls;
+}
+
+//-------------------------------------------------------------------------------------------------
+
+static void InputPhoneApplyWebControlsOverride(void)
+{
+  if (s_iPhoneControlsOverride >= (int)PHONE_CONTROLS_DISABLED &&
+      s_iPhoneControlsOverride <= (int)PHONE_CONTROLS_TOUCH_TURN)
+    g_ePhoneControls = (ePhoneControls)s_iPhoneControlsOverride;
+}
+
+//-------------------------------------------------------------------------------------------------
+#endif
 
 static int InputPhoneTouchInVisibleButton(const tInputPhoneTouch *pTouch)
 {
@@ -1312,8 +1372,9 @@ void InputInit(void)
 
   s_bInitialized = true;
   InputResetBindings();
-#if defined(IS_ANDROID)
-  InputPhoneResetTouches();
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive())
+    InputPhoneResetTouches();
 #endif
 
 #if defined(_WIN32)
@@ -1349,8 +1410,9 @@ void InputShutdown(void)
 #endif
   InputCancelPendingDeviceRefresh();
   InputCloseAllDevices();
-#if defined(IS_ANDROID)
-  InputPhoneShutdown();
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive())
+    InputPhoneShutdown();
 #endif
 #if defined(_WIN32)
   SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
@@ -1372,23 +1434,25 @@ void InputHandleEvent(const SDL_Event *pEvent)
   if (!pEvent || !s_bInitialized)
     return;
 
-#if defined(IS_ANDROID)
-  switch (pEvent->type) {
-    case SDL_EVENT_FINGER_DOWN:
-    case SDL_EVENT_FINGER_UP:
-    case SDL_EVENT_FINGER_MOTION:
-    case SDL_EVENT_FINGER_CANCELED:
-      InputPhoneHandleTouchEvent(pEvent);
-      break;
-    case SDL_EVENT_WINDOW_HIDDEN:
-    case SDL_EVENT_WINDOW_MINIMIZED:
-    case SDL_EVENT_WINDOW_FOCUS_LOST:
-    case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
-    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-      InputPhoneResetTouches();
-      break;
-    default:
-      break;
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive()) {
+    switch (pEvent->type) {
+      case SDL_EVENT_FINGER_DOWN:
+      case SDL_EVENT_FINGER_UP:
+      case SDL_EVENT_FINGER_MOTION:
+      case SDL_EVENT_FINGER_CANCELED:
+        InputPhoneHandleTouchEvent(pEvent);
+        break;
+      case SDL_EVENT_WINDOW_HIDDEN:
+      case SDL_EVENT_WINDOW_MINIMIZED:
+      case SDL_EVENT_WINDOW_FOCUS_LOST:
+      case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+      case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        InputPhoneResetTouches();
+        break;
+      default:
+        break;
+    }
   }
 #endif
 
@@ -1408,7 +1472,8 @@ void InputUpdate(void)
     return;
 
 #if defined(IS_ANDROID)
-  InputPhoneUpdateSensor();
+  if (ROLLERPhoneUIActive())
+    InputPhoneUpdateSensor();
 #endif
 
   if (InputMaybeApplyPendingDeviceRefresh())
@@ -2568,9 +2633,10 @@ int InputGetSteeringValue(int iPlayer)
 
 int InputPhoneAutoAccelerate(void)
 {
-#if defined(IS_ANDROID)
-  return g_ePhoneControls == PHONE_CONTROLS_TILT_TURN ||
-         g_ePhoneControls == PHONE_CONTROLS_TOUCH_TURN;
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  return ROLLERPhoneUIActive() &&
+         (g_ePhoneControls == PHONE_CONTROLS_TILT_TURN ||
+          g_ePhoneControls == PHONE_CONTROLS_TOUCH_TURN);
 #else
   return 0;
 #endif
@@ -2578,9 +2644,53 @@ int InputPhoneAutoAccelerate(void)
 
 //-------------------------------------------------------------------------------------------------
 
+#if defined(IS_ANDROID)
+void InputSetForceLandscape(bool bForceLandscape)
+{
+  JNIEnv *pEnv;
+  jobject activity;
+  jclass activityClass;
+  jmethodID setLandscapeModeEnabled;
+
+  g_bForceLandscape = bForceLandscape;
+  pEnv = (JNIEnv *)SDL_GetAndroidJNIEnv();
+  if (!pEnv)
+    return;
+
+  activity = (jobject)SDL_GetAndroidActivity();
+  if (!activity)
+    return;
+
+  activityClass = (*pEnv)->GetObjectClass(pEnv, activity);
+  if (!activityClass)
+    goto cleanup_activity;
+
+  setLandscapeModeEnabled = (*pEnv)->GetMethodID(
+      pEnv, activityClass, "setLandscapeModeEnabled", "(Z)V");
+  if (setLandscapeModeEnabled) {
+    (*pEnv)->CallVoidMethod(pEnv, activity, setLandscapeModeEnabled,
+                            bForceLandscape ? JNI_TRUE : JNI_FALSE);
+  }
+
+  if ((*pEnv)->ExceptionCheck(pEnv)) {
+    (*pEnv)->ExceptionDescribe(pEnv);
+    (*pEnv)->ExceptionClear(pEnv);
+  }
+
+  (*pEnv)->DeleteLocalRef(pEnv, activityClass);
+cleanup_activity:
+  (*pEnv)->DeleteLocalRef(pEnv, activity);
+}
+#endif
+
+//-------------------------------------------------------------------------------------------------
+
 int InputPhoneBrakePressed(void)
 {
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (!ROLLERPhoneUIActive())
+    return 0;
+
   if (g_ePhoneControls == PHONE_CONTROLS_TILT_TURN) {
     for (int iTouch = 0; iTouch < INPUT_PHONE_MAX_TOUCHES; ++iTouch) {
       if (s_aPhoneTouches[iTouch].iActive &&
@@ -2604,7 +2714,10 @@ int InputPhoneBrakePressed(void)
 
 int InputGetPhoneSteeringValue(void)
 {
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (!ROLLERPhoneUIActive())
+    return 0;
+
   if (g_ePhoneControls == PHONE_CONTROLS_TILT_TURN) {
     float fTilt;
     float fMagnitude;
@@ -2660,19 +2773,21 @@ void InputGetPhoneControlDebugState(int *piLeft, int *piRight, int *piBrake)
   int iRight = 0;
   int iBrake = 0;
 
-#if defined(IS_ANDROID)
-  if (g_ePhoneControls == PHONE_CONTROLS_TILT_TURN) {
-    iBrake = InputPhoneBrakePressed();
-  } else if (g_ePhoneControls == PHONE_CONTROLS_TOUCH_TURN) {
-    for (int iTouch = 0; iTouch < INPUT_PHONE_MAX_TOUCHES; ++iTouch) {
-      tInputPhoneTouch *pTouch = &s_aPhoneTouches[iTouch];
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive()) {
+    if (g_ePhoneControls == PHONE_CONTROLS_TILT_TURN) {
+      iBrake = InputPhoneBrakePressed();
+    } else if (g_ePhoneControls == PHONE_CONTROLS_TOUCH_TURN) {
+      for (int iTouch = 0; iTouch < INPUT_PHONE_MAX_TOUCHES; ++iTouch) {
+        tInputPhoneTouch *pTouch = &s_aPhoneTouches[iTouch];
 
-      if (InputPhoneTouchInTurnRegion(pTouch, 0))
-        iLeft = 1;
-      else if (InputPhoneTouchInTurnRegion(pTouch, 1))
-        iRight = 1;
-      if (InputPhoneTouchInBrakeRegion(pTouch))
-        iBrake = 1;
+        if (InputPhoneTouchInTurnRegion(pTouch, 0))
+          iLeft = 1;
+        else if (InputPhoneTouchInTurnRegion(pTouch, 1))
+          iRight = 1;
+        if (InputPhoneTouchInBrakeRegion(pTouch))
+          iBrake = 1;
+      }
     }
   }
 #endif
@@ -2873,7 +2988,7 @@ static int InputParseRendererSetting(const char *szValue)
 
 //-------------------------------------------------------------------------------------------------
 
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
 static int InputParsePhoneControlsSetting(const char *szValue)
 {
   int iValue;
@@ -3072,13 +3187,25 @@ static int InputParseDebugSetting(const char *szName, const char *szValue)
   }
 
 #if defined(IS_ANDROID)
-  if (InputStringEqualsNoCase(szName, "PhoneControls") ||
-      InputStringEqualsNoCase(szName, "AndroidPhoneControls")) {
+  if (InputStringEqualsNoCase(szName, "ForceLandscape") ||
+      InputStringEqualsNoCase(szName, "AndroidForceLandscape")) {
+    if (!InputParseBoolSetting(szValue, &bValue))
+      return 0;
+    g_bForceLandscape = bValue;
+    return 1;
+  }
+#endif
+
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive() &&
+      (InputStringEqualsNoCase(szName, "PhoneControls") ||
+       InputStringEqualsNoCase(szName, "AndroidPhoneControls"))) {
     return InputParsePhoneControlsSetting(szValue);
   }
 
-  if (InputStringEqualsNoCase(szName, "ShowActiveTouchControls") ||
-      InputStringEqualsNoCase(szName, "PhoneControlsShowActive")) {
+  if (ROLLERPhoneUIActive() &&
+      (InputStringEqualsNoCase(szName, "ShowActiveTouchControls") ||
+       InputStringEqualsNoCase(szName, "PhoneControlsShowActive"))) {
     if (!InputParseBoolSetting(szValue, &bValue))
       return 0;
     g_bShowActiveTouchControls = bValue;
@@ -3453,12 +3580,16 @@ int InputLoadConfig(void)
   uint32 uiCommunityTrackCRC = 0;
 
   InputResetBindings();
+#if defined(IS_ANDROID)
+  g_bForceLandscape = true;
+#endif
 #if defined(IS_WASM)
   s_byPendingDefaultGamepadPlayers = 0;
 #endif
-#if defined(IS_ANDROID)
-  g_ePhoneControls = PHONE_CONTROLS_TILT_TURN;
-  g_bShowActiveTouchControls = false;
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive()) {
+    g_ePhoneControls = PHONE_CONTROLS_TILT_TURN;
+  }
 #endif
 
   fp = ROLLERfopen("ROLLER.INI", "r");
@@ -3474,8 +3605,14 @@ int InputLoadConfig(void)
 #else
     InputApplyDefaultGamepadBindings();
 #endif
+#if defined(IS_WASM)
+    InputPhoneApplyWebControlsOverride();
+#endif
     InputApplyWindowConfig();
     InputResolveAllBindings();
+#if defined(IS_ANDROID)
+    InputSetForceLandscape(g_bForceLandscape);
+#endif
     return 0;
   }
 
@@ -3527,6 +3664,9 @@ int InputLoadConfig(void)
   }
 
   fclose(fp);
+#if defined(IS_WASM)
+  InputPhoneApplyWebControlsOverride();
+#endif
 #if defined(IS_ANDROID)
   if (ROLLERAudioMusicAvailable())
     InputApplyMusicSource(1);
@@ -3546,6 +3686,9 @@ int InputLoadConfig(void)
    * window is a harmless no-op. */
   InputApplyWindowConfig();
   InputResolveAllBindings();
+#if defined(IS_ANDROID)
+  InputSetForceLandscape(g_bForceLandscape);
+#endif
   return 1;
 }
 
@@ -3641,10 +3784,15 @@ void InputSaveConfig(void)
   fprintf(fp, "WindowsInputBackend=%s\n",
           InputGetWindowsBackend() == INPUT_WINDOWS_BACKEND_SDL_DINPUT ? "SDLDirectInput" : "WinMM");
 #endif
+#if defined(IS_ANDROID) || defined(IS_WASM)
+  if (ROLLERPhoneUIActive()) {
+    fprintf(fp, "PhoneControls=%d\n", (int)g_ePhoneControls);
+    fprintf(fp, "ShowActiveTouchControls=%d\n",
+            g_bShowActiveTouchControls ? 1 : 0);
+  }
+#endif
 #if defined(IS_ANDROID)
-  fprintf(fp, "PhoneControls=%d\n", (int)g_ePhoneControls);
-  fprintf(fp, "ShowActiveTouchControls=%d\n",
-          g_bShowActiveTouchControls ? 1 : 0);
+  fprintf(fp, "ForceLandscape=%d\n", g_bForceLandscape ? 1 : 0);
 #endif
   fprintf(fp, "[CommunityTracks]\n");
   if (TrackLoad == TRACK_LOAD_COMMUNITY &&
