@@ -18,6 +18,8 @@ struct CRTFilter;
 SceneRendererGPU *scene_render_get_gpu(struct SceneRenderer *renderer);
 
 SceneRendererGPU *scene_render_gpu_create(SDL_GPUDevice *device, SDL_Window *window);
+/* Creates the editor/spike path with no SDL_Window and a fixed RGBA8 target. */
+SceneRendererGPU *scene_render_gpu_create_windowless(SDL_GPUDevice *device);
 void              scene_render_gpu_destroy(SceneRendererGPU *r);
 
 /* Generic one-off GPU upload helpers -- not tied to any SceneRendererGPU
@@ -31,12 +33,31 @@ SDL_GPUBuffer  *scene_render_gpu_upload_buffer(SDL_GPUDevice *dev, SDL_GPUBuffer
                                                 const void *data, Uint32 size);
 
 void scene_render_gpu_begin_frame(SceneRendererGPU *r);
-void scene_render_gpu_end_frame(SceneRendererGPU *r);
+/* Submits the offscreen scene and, when a window exists, late-acquires and
+ * presents its swapchain texture. Returns false if submission/presentation
+ * setup fails. */
+bool scene_render_gpu_end_frame(SceneRendererGPU *r);
+/* Renders the same pre-presentation resolved scene as end_frame at the
+ * caller's explicit device-pixel width/height, independent of the window and
+ * renderScale, then waits for the GPU and copies it to top-left-origin,
+ * straight-alpha RGBA8. The destination is untouched when validation or GPU
+ * readback fails. */
+bool scene_render_gpu_end_frame_readback(SceneRendererGPU *r,
+                                         uint8 *pbyPixels,
+                                         Uint32 uiBufferSize,
+                                         Uint32 uiRowPitch,
+                                         Uint32 uiWidth,
+                                         Uint32 uiHeight);
 void scene_render_gpu_cancel_frame(SceneRendererGPU *r);
 void scene_render_gpu_discard_queued(SceneRendererGPU *r);
 
 void scene_render_gpu_set_viewport(SceneRendererGPU *r,
                                    int x, int y, int w, int h);
+/* Keeps the legacy camera projection tied to a logical render height while
+ * rasterizing into an independently sized physical viewport. Zero disables
+ * the override and preserves normal game viewport behavior. */
+void scene_render_gpu_set_projection_reference_height(SceneRendererGPU *r,
+                                                       int height);
 
 void scene_render_gpu_set_camera(SceneRendererGPU *r,
                                  const SceneRenderCamera *cam);
@@ -52,6 +73,12 @@ void               scene_render_gpu_free_texture(SceneRendererGPU *r,
                                                  SceneTextureHandle handle);
 SceneTextureHandle scene_render_gpu_get_texture_handle(const SceneRendererGPU *r,
                                                        int tex_idx);
+/* E1-S9. Live slot occupancy and the number of SDL_GPUTexture objects those
+ * slots still own. Both are bounded, so a reload that leaked its predecessor's
+ * atlas shows up as a count that climbs instead of returning to the same
+ * steady state. */
+int scene_render_gpu_texture_slots_in_use(const SceneRendererGPU *r);
+int scene_render_gpu_textures_resident(const SceneRendererGPU *r);
 
 void scene_render_gpu_quad_world_legacy(SceneRendererGPU *r,
                                         const SceneRenderVertex verts[4],

@@ -6,8 +6,10 @@
 
 extern char revs_files1[6][13];
 extern char revs_files2[6][13];
-extern char texture_file[13];
-extern char bldtex_file[13];
+/* Direct editor loads replace these legacy 8.3 names with resolved absolute
+ * document paths before the texture loaders run. */
+extern char texture_file[ROLLER_MAX_PATH];
+extern char bldtex_file[ROLLER_MAX_PATH];
 extern char gencartex_name[11];
 extern int car_remap[4096];
 extern int cargen_remap[256];
@@ -25,6 +27,10 @@ void line(uint8 *pScrBuf, int iX0, int iY0, int iX1, int iY1, uint8 byColor);
 void LoadPanel();
 void InitRemaps();
 void LoadGenericCarTextures();
+/* Editor-core callers resolve assets against the document/fallback roots
+ * before entering the legacy loader. The game wrapper above keeps using the
+ * original gencartex_name global. */
+void LoadGenericCarTexturesFromFile(const char *szTextureFile);
 void LoadCarTexture(int iCartexIdx, uint8 byTexSlotIdx);
 void LoadBldTextures();
 void LoadTextures();

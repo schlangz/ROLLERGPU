@@ -1,7 +1,11 @@
 [tools]
+cmake = "3.30.2"
+ninja = "1.12.0"
+"pipx:mdformat" = { version = "1.0.0", uvx_args = "--with mdformat-gfm==1.0.0 --with mdformat-frontmatter==2.1.2" }
 python = "3"
 "ubi:zigtools/zls" = "0.15.0"
 usage = "latest"
+uv = "0.12.2"
 zig = "0.15.2"
 
 [env]
@@ -27,6 +31,14 @@ run = "rm -rf zig-out .zig-cache"
 [tasks.test]
 description = "Run tests"
 run = "zig build test"
+
+[tasks.format-markdown]
+description = "Format Markdown"
+run = "git ls-files -z '*.md' ':!:LICENSE.md' | xargs -0 mdformat"
+
+[tasks.lint-markdown]
+description = "Check Markdown formatting"
+run = "git ls-files -z '*.md' ':!:LICENSE.md' | xargs -0 mdformat --check"
 
 [tasks.install-emsdk]
 description = "Install the pinned Emscripten SDK"

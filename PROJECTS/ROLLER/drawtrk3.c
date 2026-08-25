@@ -7,9 +7,16 @@
 #include "moving.h"
 #include "transfrm.h"
 #include "building.h"
+#include "plans.h"
 #include "tower.h"
 #include "roller.h"
 #include "render_queue_3d.h"
+#include "editor_helpers.h"
+#include "editor_overlay.h"
+#include "editor_reference_mesh.h"
+#include "editor_surface.h"
+#include "graphics.h"
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -46,6 +53,16 @@ int VisibleCars;    //001446A4
 int num_pols;       //001446A8
 int small_poly;     //001446AC
 
+static tEdSurfaceSelection g_EditorSurfaceSelection;
+
+/*
+ * E3A-S3. The colour the pre-modernization editor outlined selected chunks in
+ * (WhipLib ShapeFactory::MakeSelectedChunks used GL_LINES at palette 0xDA).
+ * Keeping it means a selection looks the way editors of this track format
+ * expect it to look.
+ */
+#define ED_SELECTION_HIGHLIGHT_PALETTE_COLOUR 0xDAu
+
 //-------------------------------------------------------------------------------------------------
 static int remap_surface_to_flat(int surfaceFlags)
 {
@@ -76,7 +93,7 @@ static void world_verts_cross_first(GameRenderVertex *verts,
 
 static const tVec3 *ground_world_point(int sec, int pt)
 {
-    if (GroundColour[sec][GROUND_COLOUR_OFLOOR] == -2 && TrackScreenXYZ[sec].iClipCount != 99) {
+    if (GroundColour[sec][GROUND_COLOUR_OFLOOR] == -2) {
         if (pt == 2) return &TrakPt[sec].pointAy[0];
         if (pt == 3) return &TrakPt[sec].pointAy[4];
     }
@@ -152,6 +169,549 @@ static void world_verts_left_wall(GameRenderVertex *verts,
     verts[3].u = 0; verts[3].v = 0;
 }
 
+typedef struct
+{
+    GameRenderer *pRenderer;
+    const tEdMaterialTable *pMaterials;
+    const tEdSurfaceSelection *pSelection;
+} tEdRenderSurfaceContext;
+
+#if defined(ROLLER_EDITOR_CORE)
+/*
+ * E3A-S2. The renderer offers no line primitive, so each edge is drawn as the
+ * thin front-facing ribbon ed_surface_wireframe_edge_quad() builds, flat-
+ * filled in one palette colour. Flat fill is the same mechanism the selection
+ * highlight uses: clear the texture bits, put the colour index in the low
+ * byte.
+ */
+#define ED_WIREFRAME_PALETTE_COLOUR 255u
+
+static void draw_emitted_surface_edges(
+    const tEdRenderSurfaceContext *pContext,
+    const tEdSurfaceEmission *pSurface,
+    uint32_t uiEdgeFlags)
+{
+    const int iWireflags = (int)uiEdgeFlags;
+
+    for (uint32_t uiEdge = 0; uiEdge < ED_SURFACE_VERTEX_COUNT; uiEdge++) {
+        float afEdgeQuad[ED_SURFACE_VERTEX_COUNT][3];
+        GameRenderVertex aEdgeVertices[ED_SURFACE_VERTEX_COUNT];
+
+        if (!ed_surface_wireframe_edge_quad(pSurface, uiEdge, afEdgeQuad))
+            continue;
+        for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+            aEdgeVertices[i].x = afEdgeQuad[i][0];
+            aEdgeVertices[i].y = afEdgeQuad[i][1];
+            aEdgeVertices[i].z = afEdgeQuad[i][2];
+            aEdgeVertices[i].u = 0.0f;
+            aEdgeVertices[i].v = 0.0f;
+            startsx[i] = 0;
+            startsy[i] = 0;
+        }
+        game_render_quad_world_subdivide_type(
+            pContext->pRenderer, aEdgeVertices, TEXTURE_HANDLE_INVALID,
+            iWireflags, pSurface->iRenderSubdivideType,
+            pSurface->fSubdivideThreshold);
+    }
+}
+
+/* Texture bits cleared, palette colour in the low byte -- the same flat-fill
+ * shape F-S4b's ed_surface_selection_render_flags() produces. */
+static uint32_t editor_edge_flags(const tEdSurfaceEmission *pSurface,
+                                  uint32_t uiPaletteColour)
+{
+    return (pSurface->uiRenderFlags
+            & (SURFACE_MASK_FLAGS
+               & ~(SURFACE_FLAG_APPLY_TEXTURE
+                   | SURFACE_FLAG_TRANSPARENT
+                   | SURFACE_FLAG_PARTIAL_TRANS)))
+        | uiPaletteColour;
+}
+
+#endif
+
+/*
+ * E3A-S4 helper overlays. These are editor furniture, not track content: they
+ * never reach the canonical emitter, so no exporter can pick them up (AD-6d),
+ * and they carry no chunk identity for the same reason. They are flat-filled
+ * quads through the same world-quad path everything else uses.
+ */
+#define ED_CENTER_LINE_PALETTE_COLOUR 0xF0u
+#define ED_AI_LINE_PALETTE_COLOUR 0xE7u
+/* E3A-S5's two are the legacy editor's own marker colours, unlike the three
+ * above, which had to be chosen because the GL renderer that drew those
+ * helpers is gone. */
+#define ED_AUDIO_MARKER_PALETTE_COLOUR 0x8Fu
+#define ED_STUNT_MARKER_PALETTE_COLOUR 0xFFu
+
+static void draw_helper_quad(GameRenderer *pRenderer,
+                             const float afQuad[4][3],
+                             uint32_t uiPaletteColour)
+{
+    GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT];
+
+    for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+        aVertices[i].x = afQuad[i][0];
+        aVertices[i].y = afQuad[i][1];
+        aVertices[i].z = afQuad[i][2];
+        aVertices[i].u = 0.0f;
+        aVertices[i].v = 0.0f;
+        startsx[i] = 0;
+        startsy[i] = 0;
+    }
+    game_render_quad_world_subdivide_type(
+        pRenderer, aVertices, TEXTURE_HANDLE_INVALID,
+        (int)uiPaletteColour, 0, 0.0f);
+}
+
+/* Walks one helper line the whole way round the track, one ribbon per chunk
+ * pair. uiLine is an AI line index, or ED_HELPER_AI_LINE_COUNT for the centre
+ * line. */
+static void draw_helper_line(GameRenderer *pRenderer, uint32_t uiLine,
+                             uint32_t uiPaletteColour, bool bAttachLast)
+{
+    const bool bCenterLine = uiLine >= ED_HELPER_AI_LINE_COUNT;
+
+    for (int iChunk = 0; iChunk < TRAK_LEN; iChunk++) {
+        if (!bAttachLast && iChunk == TRAK_LEN - 1)
+            continue;
+        int iNextChunk = iChunk + 1 < TRAK_LEN ? iChunk + 1 : 0;
+        float afStart[3];
+        float afEnd[3];
+        float afQuad[4][3];
+        float fRoadWidth = ed_helper_road_width((uint32_t)iChunk);
+        bool bHaveSegment;
+
+        if (bCenterLine) {
+            bHaveSegment =
+                ed_helper_center_point((uint32_t)iChunk, afStart)
+                && ed_helper_center_point((uint32_t)iNextChunk, afEnd);
+        } else {
+            bHaveSegment =
+                ed_helper_ai_line_point((uint32_t)iChunk, uiLine, afStart)
+                && ed_helper_ai_line_point((uint32_t)iNextChunk, uiLine, afEnd);
+        }
+        if (!bHaveSegment || !(fRoadWidth > 0.0f))
+            continue;
+
+        /* Lift the line clear of the surface it describes so it is not lost
+         * to depth fighting with the road. */
+        afStart[ED_SURFACE_WORLD_UP_AXIS] +=
+            fRoadWidth * ED_HELPER_LINE_HEIGHT_RATIO;
+        afEnd[ED_SURFACE_WORLD_UP_AXIS] +=
+            fRoadWidth * ED_HELPER_LINE_HEIGHT_RATIO;
+        if (!ed_helper_segment_quad(
+                afStart, afEnd, fRoadWidth * ED_HELPER_LINE_WIDTH_RATIO,
+                afQuad))
+            continue;
+        draw_helper_quad(pRenderer, afQuad, uiPaletteColour);
+    }
+}
+
+/*
+ * E3A-S5. A marker is a flat icon standing across the track, so it is only
+ * ever face-on from one end of it. The legacy editor solved that by emitting
+ * every marker triangle twice with reversed indices; the same trick applies
+ * here, one extra quad per quad, and it costs nothing because only the chunks
+ * that actually carry a trigger or a ramp draw anything at all.
+ */
+static void draw_helper_marker(GameRenderer *pRenderer, uint32_t uiChunkId,
+                               eEdHelperMarker eMarker, uint32_t uiPaletteColour)
+{
+    for (uint32_t uiQuad = 0; uiQuad < ED_HELPER_MARKER_QUAD_COUNT; uiQuad++) {
+        float afQuad[4][3];
+        float afReversed[4][3];
+
+        if (!ed_helper_marker_quad(uiChunkId, eMarker, uiQuad, afQuad))
+            continue;
+        draw_helper_quad(pRenderer, afQuad, uiPaletteColour);
+        for (uint32_t uiVertex = 0; uiVertex < 4u; uiVertex++) {
+            for (uint32_t i = 0; i < 3u; i++)
+                afReversed[uiVertex][i] = afQuad[3u - uiVertex][i];
+        }
+        draw_helper_quad(pRenderer, afReversed, uiPaletteColour);
+    }
+}
+
+/*
+ * E3A-S7. The reference mesh, flat-filled in the legacy editor's own colour.
+ *
+ * The pre-modernization editor overwrote every reference-model vertex's
+ * texture coordinate with GetColorCenterCoordinates(0x8c) -- light grey -- so
+ * it was already drawn as one flat colour rather than textured. AD-13 still
+ * requires the host's texture to be copied during the call, and it is; nothing
+ * has ever drawn it, and matching the editor's behaviour means not starting.
+ */
+#define ED_REFERENCE_MESH_PALETTE_COLOUR 0x8Cu
+
+/* The renderer takes quads and nothing else, so a triangle is a quad whose
+ * last two corners coincide -- the same degenerate form the legacy quad path
+ * already tolerates everywhere else. */
+static void draw_reference_triangle(GameRenderer *pRenderer,
+                                    const float afTriangle[3][3])
+{
+    float afQuad[ED_SURFACE_VERTEX_COUNT][3];
+
+    for (uint32_t i = 0; i < 3u; i++) {
+        for (uint32_t j = 0; j < 3u; j++)
+            afQuad[i][j] = afTriangle[i][j];
+    }
+    for (uint32_t j = 0; j < 3u; j++)
+        afQuad[3][j] = afTriangle[2][j];
+    draw_helper_quad(pRenderer, afQuad, ED_REFERENCE_MESH_PALETTE_COLOUR);
+}
+
+void drawtrk3_editor_draw_reference_mesh(GameRenderer *pRenderer)
+{
+    uint32_t uiTriangles;
+    bool bWireframe;
+
+    if (!pRenderer
+            || !roller_ed_overlay_enabled(
+                   ROLLER_ED_OVERLAY_SHOW_REFERENCE_MESH))
+        return;
+    uiTriangles = ed_reference_mesh_triangle_count();
+    bWireframe = ed_reference_mesh_wireframe();
+
+    for (uint32_t uiTriangle = 0; uiTriangle < uiTriangles; uiTriangle++) {
+        float afTriangle[3][3];
+
+        if (!ed_reference_mesh_world_triangle(uiTriangle, afTriangle))
+            continue;
+        if (!bWireframe) {
+            draw_reference_triangle(pRenderer, afTriangle);
+            continue;
+        }
+        /* Wireframe reuses E3A-S2's ribbon: the renderer still has no line
+         * primitive, and an edge of a reference triangle is no different from
+         * an edge of a track surface. The ribbon needs the triangle's plane,
+         * so the quad form is fed the third corner twice -- its Newell normal
+         * is the triangle's. */
+        {
+            float afQuad[ED_SURFACE_VERTEX_COUNT][3];
+            float afNormal[3];
+
+            for (uint32_t i = 0; i < 3u; i++) {
+                for (uint32_t j = 0; j < 3u; j++)
+                    afQuad[i][j] = afTriangle[i][j];
+            }
+            for (uint32_t j = 0; j < 3u; j++)
+                afQuad[3][j] = afTriangle[2][j];
+            if (!ed_surface_compute_normals((const float (*)[3])afQuad,
+                                            afNormal, NULL))
+                continue;
+            for (uint32_t uiEdge = 0; uiEdge < 3u; uiEdge++) {
+                float afEdgeQuad[ED_SURFACE_VERTEX_COUNT][3];
+
+                if (!ed_surface_wireframe_edge_quad_points(
+                        (const float (*)[3])afTriangle, 3u, afNormal, uiEdge,
+                        afEdgeQuad))
+                    continue;
+                draw_helper_quad(pRenderer, afEdgeQuad,
+                                 ED_REFERENCE_MESH_PALETTE_COLOUR);
+            }
+        }
+    }
+}
+
+void drawtrk3_editor_draw_helpers(GameRenderer *pRenderer)
+{
+    bool bAttachLast;
+
+    if (!pRenderer)
+        return;
+    bAttachLast = !roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_DETACH_LAST);
+
+    if (roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_SHOW_AI_LINES)) {
+        for (uint32_t uiLine = 0; uiLine < ED_HELPER_AI_LINE_COUNT; uiLine++)
+            draw_helper_line(
+                pRenderer, uiLine, ED_AI_LINE_PALETTE_COLOUR, bAttachLast);
+    }
+    if (roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_SHOW_CENTER_LINE)) {
+        draw_helper_line(pRenderer, ED_HELPER_AI_LINE_COUNT,
+                         ED_CENTER_LINE_PALETTE_COLOUR, bAttachLast);
+    }
+    /* Markers last, so they read against the lines and floor under them. */
+    if (roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_SHOW_AUDIO_MARKERS)) {
+        for (int iChunk = 0; iChunk < TRAK_LEN; iChunk++) {
+            if (ed_helper_chunk_has_audio((uint32_t)iChunk))
+                draw_helper_marker(pRenderer, (uint32_t)iChunk,
+                                   ED_HELPER_MARKER_AUDIO,
+                                   ED_AUDIO_MARKER_PALETTE_COLOUR);
+        }
+    }
+    if (roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_SHOW_STUNT_MARKERS)) {
+        const uint32_t uiStuntCount = ed_helper_stunt_count();
+
+        for (uint32_t uiStunt = 0; uiStunt < uiStuntCount; uiStunt++) {
+            uint32_t uiChunkId;
+
+            if (ed_helper_stunt_chunk(uiStunt, &uiChunkId))
+                draw_helper_marker(pRenderer, uiChunkId,
+                                   ED_HELPER_MARKER_STUNT,
+                                   ED_STUNT_MARKER_PALETTE_COLOUR);
+        }
+    }
+    if (roller_ed_overlay_enabled(ROLLER_ED_OVERLAY_SHOW_TOWER_MARKERS)) {
+        for (int iTowerIdx = 0; iTowerIdx < NumTowers; iTowerIdx++)
+            tower_emit_marker(iTowerIdx, 1.0f);
+    }
+}
+
+static void draw_emitted_surface(const tEdSurfaceEmission *pSurface,
+                                 void *pUserData)
+{
+    tEdRenderSurfaceContext *pContext = pUserData;
+    GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT];
+    const tEdMaterial *pFrontMaterial;
+    TextureHandle hTexture = TEXTURE_HANDLE_INVALID;
+    bool bSelected;
+    uint32_t uiRenderFlags;
+
+    if (!pSurface || !pContext
+            || pSurface->uiVertexCount != ED_SURFACE_VERTEX_COUNT)
+        return;
+
+    bSelected = ed_surface_selection_matches(
+        pContext->pSelection, pSurface);
+
+#if defined(ROLLER_EDITOR_CORE)
+    /*
+     * Overlay filtering keys on the canonical unSurfaceClass the emitter
+     * published (AD-8), never on anything reconstructed at draw time. The
+     * edge passes run after the surface so they draw over their own fill.
+     *
+     * E3A-S3: a selected surface is outlined in the highlight colour instead
+     * of its usual wireframe colour, so the two passes never fight over the
+     * same coincident ribbon, and the selection wins.
+     */
+    {
+        const bool bSurfaceVisible =
+            roller_ed_overlay_surface_class_visible(pSurface->unSurfaceClass);
+        const bool bWireframeVisible =
+            roller_ed_overlay_wireframe_class_visible(pSurface->unSurfaceClass);
+
+        if (!bSurfaceVisible) {
+            if (bSelected)
+                draw_emitted_surface_edges(
+                    pContext, pSurface,
+                    ed_surface_selection_render_flags(
+                        pContext->pSelection, pSurface));
+            else if (bWireframeVisible)
+                draw_emitted_surface_edges(
+                    pContext, pSurface,
+                    editor_edge_flags(pSurface, ED_WIREFRAME_PALETTE_COLOUR));
+            return;
+        }
+    }
+#endif
+
+    pFrontMaterial = ed_material_table_get(
+        pContext->pMaterials, pSurface->uiFrontMaterialId);
+    if (!pFrontMaterial)
+        return;
+    /*
+     * E3A-S3 outlines the selection rather than flat-filling it, so the fill
+     * keeps its own flags and its texture: the maintainer edits against those
+     * textures, and Select All would otherwise flatten the whole track.
+     */
+    uiRenderFlags = pSurface->uiRenderFlags;
+
+    for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+        aVertices[i].x = pSurface->aVertices[i].fPosition[0];
+        aVertices[i].y = pSurface->aVertices[i].fPosition[1];
+        aVertices[i].z = pSurface->aVertices[i].fPosition[2];
+        aVertices[i].u = 0.0f;
+        aVertices[i].v = 0.0f;
+        startsx[i] = pSurface->aVertices[i].iRenderU16_16;
+        startsy[i] = pSurface->aVertices[i].iRenderV16_16;
+    }
+
+    if (pFrontMaterial->uiKind == ROLLER_ED_MATERIAL_TEXTURED_TILE
+            || pFrontMaterial->uiKind == ROLLER_ED_MATERIAL_TEXTURED_PAIR) {
+        hTexture = game_render_get_texture_handle(
+            pContext->pRenderer, (int)pFrontMaterial->uiTextureSet);
+    }
+
+    game_render_quad_world_subdivide_type(
+        pContext->pRenderer, aVertices, hTexture,
+        (int)uiRenderFlags, pSurface->iRenderSubdivideType,
+        pSurface->fSubdivideThreshold);
+
+#if defined(ROLLER_EDITOR_CORE)
+    if (bSelected)
+        draw_emitted_surface_edges(
+            pContext, pSurface,
+            ed_surface_selection_render_flags(pContext->pSelection, pSurface));
+    else if (roller_ed_overlay_wireframe_class_visible(
+                 pSurface->unSurfaceClass))
+        draw_emitted_surface_edges(
+            pContext, pSurface,
+            editor_edge_flags(pSurface, ED_WIREFRAME_PALETTE_COLOUR));
+#else
+    (void)bSelected;
+#endif
+}
+
+static uint32_t editor_surface_texture_count(uint32_t uiTextureSet)
+{
+    if (uiTextureSet == TEXTURE_BANK_TRACK)
+        return num_textures[19] > 0 ? (uint32_t)num_textures[19] : 0u;
+    if (uiTextureSet == TEXTURE_BANK_BUILDING)
+        return num_textures[17] > 0 ? (uint32_t)num_textures[17] : 0u;
+    if (uiTextureSet == TEXTURE_BANK_CARGEN)
+        return num_textures[18] > 0 ? (uint32_t)num_textures[18] : 0u;
+    return 0u;
+}
+
+bool drawtrk3_editor_texture_atlas(uint32_t uiTextureSet,
+                                   tEdTextureAtlas *pAtlas)
+{
+    uint32_t uiTileSize = gfx_size ? 32u : 64u;
+    uint32_t uiTilesPerRow = 256u / uiTileSize;
+    uint32_t uiTileCount;
+    uint32_t uiAtlasRows;
+
+    if (!pAtlas)
+        return false;
+
+    uiTileCount = editor_surface_texture_count(uiTextureSet);
+    uiAtlasRows = uiTileCount
+        ? (uiTileCount + uiTilesPerRow - 1u) / uiTilesPerRow
+        : 1u;
+    pAtlas->uiTextureSet = uiTextureSet;
+    pAtlas->uiWidth = 256u;
+    pAtlas->uiHeight = uiAtlasRows * uiTileSize;
+    pAtlas->uiTileSize = uiTileSize;
+    pAtlas->uiTileCount = uiTileCount;
+    return true;
+}
+
+/*
+ * Register every legacy texture bank the canonical stream can reference, so
+ * main-track and building/sign surfaces resolve tile identity against their
+ * own bank rather than sharing one atlas description.
+ */
+bool drawtrk3_init_editor_material_table(tEdMaterialTable *pTable,
+                                         tEdMaterial *pStorage,
+                                         uint32_t uiCapacity)
+{
+    static const uint32_t auiTextureSets[] = {
+        TEXTURE_BANK_BUILDING,
+        TEXTURE_BANK_CARGEN
+    };
+    tEdTextureAtlas Atlas;
+
+    if (!drawtrk3_editor_texture_atlas(TEXTURE_BANK_TRACK, &Atlas)
+            || !ed_material_table_init(pTable, pStorage, uiCapacity, Atlas))
+        return false;
+
+    for (uint32_t i = 0;
+            i < sizeof(auiTextureSets) / sizeof(auiTextureSets[0]); i++) {
+        if (!drawtrk3_editor_texture_atlas(auiTextureSets[i], &Atlas)
+                || !ed_material_table_set_atlas(pTable, Atlas))
+            return false;
+    }
+    return true;
+}
+
+static bool emit_surface_to_consumer(
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    const tEdSurfaceInfo *pInfo,
+    tEdMaterialTable *pMaterials,
+    tEdEmitSurfaceFn pfnEmit,
+    void *pUserData)
+{
+    tEdSurfaceInfo Info;
+    float afWorldVertices[ED_SURFACE_VERTEX_COUNT][3];
+
+    if (!aVertices || !pInfo || !pMaterials || !pfnEmit)
+        return false;
+
+    Info = *pInfo;
+    for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+        afWorldVertices[i][0] = aVertices[i].x;
+        afWorldVertices[i][1] = aVertices[i].y;
+        afWorldVertices[i][2] = aVertices[i].z;
+    }
+
+    if (Info.uiBackSurfaceFlags == ED_MATERIAL_ID_NONE
+            && (Info.uiRenderFlags & SURFACE_FLAG_BACK)
+            && Info.uiTextureSet <= TEXTURE_BANK_BUILDING) {
+        uint32_t uiTile =
+            Info.uiRenderFlags & SURFACE_MASK_TEXTURE_INDEX;
+        Info.uiBackSurfaceFlags =
+            (uint32_t)texture_back[256 * Info.uiTextureSet + uiTile];
+    }
+
+    return ed_emit_surface(
+        afWorldVertices, &Info, pMaterials, pfnEmit, pUserData);
+}
+
+bool drawtrk3_emit_surface_to_renderer(
+    GameRenderer *pRenderer,
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    const tEdSurfaceInfo *pInfo)
+{
+    tEdMaterial aMaterials[2];
+    tEdMaterialTable MaterialTable;
+    tEdRenderSurfaceContext RenderContext;
+
+    if (!pRenderer || !aVertices || !pInfo)
+        return false;
+
+    if (!drawtrk3_init_editor_material_table(&MaterialTable, aMaterials, 2u))
+        return false;
+
+    RenderContext.pRenderer = pRenderer;
+    RenderContext.pMaterials = &MaterialTable;
+    RenderContext.pSelection = &g_EditorSurfaceSelection;
+    return emit_surface_to_consumer(
+        aVertices, pInfo, &MaterialTable,
+        draw_emitted_surface, &RenderContext);
+}
+
+void drawtrk3_editor_selection_set(uint32_t uiFirstChunkId,
+                                   uint32_t uiLastChunkId,
+                                   uint16_t unSurfaceClass,
+                                   uint8_t byHighlightColour)
+{
+    g_EditorSurfaceSelection.uiFirstChunkId = uiFirstChunkId;
+    g_EditorSurfaceSelection.uiLastChunkId = uiLastChunkId;
+    g_EditorSurfaceSelection.unSurfaceClass = unSurfaceClass;
+    g_EditorSurfaceSelection.byHighlightColour = byHighlightColour;
+    g_EditorSurfaceSelection.bEnabled = true;
+}
+
+void drawtrk3_editor_selection_clear(void)
+{
+    g_EditorSurfaceSelection.bEnabled = false;
+}
+
+/*
+ * Publishes the facade's selection range to the renderer once per frame. The
+ * range is a chunk range, so it covers every surface class in it; the match
+ * itself is made per surface against the canonical uiChunkId the emitter
+ * published (AD-8), never against anything reconstructed from a draw command.
+ *
+ * Unconditional rather than editor-only: editor_legacy_scene.c is in the
+ * game's source set, and the game never reaches the render path that calls
+ * this. Overlay defaults leave the selection disabled either way.
+ */
+void drawtrk3_editor_apply_overlay_selection(void)
+{
+    uint32_t uiFirstChunk;
+    uint32_t uiLastChunk;
+
+    if (roller_ed_overlay_selection_range(&uiFirstChunk, &uiLastChunk)) {
+        drawtrk3_editor_selection_set(
+            uiFirstChunk, uiLastChunk, ED_SURFACE_SELECTION_ANY_CLASS,
+            ED_SELECTION_HIGHLIGHT_PALETTE_COLOUR);
+    } else {
+        drawtrk3_editor_selection_clear();
+    }
+}
+
 // Symmetric to left_wall_top_pt_idx — selects screenPtAy[5]'s world-space source
 // for the right wall: pointAy[5] when both adjacent RW types are non-zero, else
 // pointAy[4] when both are non-negative, else pointAy[3].
@@ -183,6 +743,490 @@ static void world_verts_right_wall(GameRenderVertex *verts,
     verts[1].u = 0; verts[1].v = 0;
     verts[2].u = 0; verts[2].v = 0;
     verts[3].u = 0; verts[3].v = 0;
+}
+
+typedef bool (*tEdEmitRawSurfaceFn)(
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    const tEdSurfaceInfo *pInfo,
+    void *pUserData);
+
+static void init_track_surface_info(tEdSurfaceInfo *pInfo,
+                                    uint32_t uiChunkId,
+                                    uint32_t uiSubdivideChunkId,
+                                    uint16_t unSurfaceClass,
+                                    int iSurfaceFlags,
+                                    int iSubdivideIndex,
+                                    bool bHighVariant)
+{
+    memset(pInfo, 0, sizeof(*pInfo));
+    pInfo->uiChunkId = uiChunkId;
+    pInfo->uiRenderFlags = (uint32_t)iSurfaceFlags;
+    pInfo->uiBackSurfaceFlags = ED_MATERIAL_ID_NONE;
+    pInfo->uiTextureSet = TEXTURE_BANK_TRACK;
+    pInfo->fSubdivideThreshold =
+        (float)(uint8)Subdivide[uiSubdivideChunkId]
+            .subdivides[iSubdivideIndex]
+        * subscale;
+    pInfo->bPairTextureEnabled =
+        (iSurfaceFlags & SURFACE_FLAG_TEXTURE_PAIR) != 0 && wide_on != 0;
+    pInfo->bHighVariant = bHighVariant;
+    pInfo->unSurfaceClass = unSurfaceClass;
+    pInfo->unContentClass = ROLLER_ED_CONTENT_AUTHORED_TRACK;
+    pInfo->byTopology = ROLLER_ED_TOPOLOGY_QUAD;
+    pInfo->byRenderUVLayout = pInfo->bPairTextureEnabled
+        ? ROLLER_ED_RENDER_UV_PAIR_HORIZONTAL
+        : ROLLER_ED_RENDER_UV_TILE;
+    pInfo->iRenderSubdivideType = GAME_RENDER_SUBDIVIDE_TYPE_AUTO;
+}
+
+static bool emit_track_raw_surface(
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    uint32_t uiChunkId,
+    uint32_t uiSubdivideChunkId,
+    uint16_t unSurfaceClass,
+    int iSurfaceFlags,
+    int iSubdivideIndex,
+    bool bHighVariant,
+    tEdEmitRawSurfaceFn pfnEmit,
+    void *pUserData)
+{
+    tEdSurfaceInfo Info;
+
+    init_track_surface_info(
+        &Info, uiChunkId, uiSubdivideChunkId,
+        unSurfaceClass, iSurfaceFlags,
+        iSubdivideIndex, bHighVariant);
+    return pfnEmit(aVertices, &Info, pUserData);
+}
+
+static int track_surface_render_flags(int iSurfaceFlags,
+                                      int iTextureToggle,
+                                      bool bApplyRenderToggles)
+{
+    if (!bApplyRenderToggles || (textures_off & iTextureToggle) == 0)
+        return iSurfaceFlags;
+    if (iSurfaceFlags & SURFACE_FLAG_APPLY_TEXTURE)
+        return remap_surface_to_flat(iSurfaceFlags);
+    return iSurfaceFlags;
+}
+
+/*
+ * Produce one canonical track surface class for a loaded chunk. This function
+ * reads only committed track geometry/material state. In particular it does
+ * not read start_sect, TrackSize, projected coordinates, camera transforms,
+ * the render queue, or any batch state.
+ */
+static bool emit_track_chunk_surface(uint32_t uiChunkId,
+                                     uint16_t unSurfaceClass,
+                                     bool bApplyRenderToggles,
+                                     tEdEmitRawSurfaceFn pfnEmit,
+                                     void *pUserData)
+{
+    int iCurrent = (int)uiChunkId;
+    int iNext;
+    int iSurfaceFlags;
+    GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT];
+
+    if (!pfnEmit || TRAK_LEN <= 0 || TRAK_LEN > MAX_TRACK_CHUNKS
+            || uiChunkId >= (uint32_t)TRAK_LEN)
+        return false;
+    iNext = iCurrent + 1;
+    if (iNext >= TRAK_LEN)
+        iNext = 0;
+
+    switch (unSurfaceClass) {
+    case ROLLER_ED_SURFACE_CLASS_CENTER:
+        iSurfaceFlags = track_surface_render_flags(
+            TrakColour[iCurrent][TRAK_COLOUR_CENTER],
+            TEX_OFF_ROAD_TEXTURES, bApplyRenderToggles);
+        world_verts_cross_first(
+            aVertices, TrakPt, iNext, iCurrent, 3, 2);
+        return emit_track_raw_surface(
+            aVertices, uiChunkId, uiChunkId,
+            unSurfaceClass, iSurfaceFlags,
+            1, false, pfnEmit, pUserData);
+
+    case ROLLER_ED_SURFACE_CLASS_LEFT_SHOULDER:
+        iSurfaceFlags = TrakColour[iCurrent][TRAK_COLOUR_LEFT_LANE];
+        if (iSurfaceFlags < 0)
+            iSurfaceFlags = -iSurfaceFlags;
+        iSurfaceFlags = track_surface_render_flags(
+            iSurfaceFlags, TEX_OFF_ROAD_TEXTURES, bApplyRenderToggles);
+        world_verts_cross_first(
+            aVertices, TrakPt, iNext, iCurrent, 2, 0);
+        return emit_track_raw_surface(
+            aVertices, uiChunkId, uiChunkId,
+            unSurfaceClass, iSurfaceFlags,
+            0, false, pfnEmit, pUserData);
+
+    case ROLLER_ED_SURFACE_CLASS_RIGHT_SHOULDER:
+        iSurfaceFlags = TrakColour[iCurrent][TRAK_COLOUR_RIGHT_LANE];
+        if (iSurfaceFlags < 0)
+            iSurfaceFlags = -iSurfaceFlags;
+        iSurfaceFlags = track_surface_render_flags(
+            iSurfaceFlags, TEX_OFF_ROAD_TEXTURES, bApplyRenderToggles);
+        world_verts_cross_first(
+            aVertices, TrakPt, iNext, iCurrent, 4, 3);
+        return emit_track_raw_surface(
+            aVertices, uiChunkId, uiChunkId,
+            unSurfaceClass, iSurfaceFlags,
+            2, false, pfnEmit, pUserData);
+
+    case ROLLER_ED_SURFACE_CLASS_LEFT_WALL:
+        iSurfaceFlags = TrakColour[iCurrent][TRAK_COLOUR_LEFT_WALL];
+        if (iSurfaceFlags == 0)
+            return true;
+        {
+            bool bHighVariant = iSurfaceFlags < 0;
+            if (bHighVariant)
+                iSurfaceFlags = -iSurfaceFlags;
+            iSurfaceFlags |= SURFACE_FLAG_FLIP_BACKFACE;
+            if (bApplyRenderToggles
+                    && (textures_off & TEX_OFF_WALL_TEXTURES) != 0) {
+                iSurfaceFlags = (iSurfaceFlags & SURFACE_FLAG_APPLY_TEXTURE)
+                    ? remap_surface_to_flat(iSurfaceFlags)
+                    : SURFACE_FLAG_SKIP_RENDER;
+            } else if (bApplyRenderToggles
+                    && (textures_off & TEX_OFF_GLASS_WALLS) != 0
+                    && (iSurfaceFlags & SURFACE_FLAG_TRANSPARENT) != 0) {
+                iSurfaceFlags = SURFACE_FLAG_SKIP_RENDER;
+            }
+            world_verts_left_wall(
+                aVertices, iNext, iCurrent, bHighVariant ? 2 : 0);
+            return emit_track_raw_surface(
+                aVertices, uiChunkId, uiChunkId,
+                unSurfaceClass, iSurfaceFlags,
+                3, bHighVariant, pfnEmit, pUserData);
+        }
+
+    case ROLLER_ED_SURFACE_CLASS_RIGHT_WALL:
+        iSurfaceFlags = TrakColour[iCurrent][TRAK_COLOUR_RIGHT_WALL];
+        if (iSurfaceFlags == 0)
+            return true;
+        {
+            bool bHighVariant = iSurfaceFlags < 0;
+            if (bHighVariant)
+                iSurfaceFlags = -iSurfaceFlags;
+            iSurfaceFlags |= SURFACE_FLAG_FLIP_BACKFACE;
+            if (bApplyRenderToggles
+                    && (textures_off & TEX_OFF_WALL_TEXTURES) != 0) {
+                iSurfaceFlags = (iSurfaceFlags & SURFACE_FLAG_APPLY_TEXTURE)
+                    ? remap_surface_to_flat(iSurfaceFlags)
+                    : SURFACE_FLAG_SKIP_RENDER;
+            } else if (bApplyRenderToggles
+                    && (textures_off & TEX_OFF_GLASS_WALLS) != 0
+                    && (iSurfaceFlags & SURFACE_FLAG_TRANSPARENT) != 0) {
+                iSurfaceFlags = SURFACE_FLAG_SKIP_RENDER;
+            }
+            world_verts_right_wall(
+                aVertices, iNext, iCurrent, bHighVariant ? 3 : 4);
+            return emit_track_raw_surface(
+                aVertices, uiChunkId, uiChunkId,
+                unSurfaceClass, iSurfaceFlags,
+                4, bHighVariant, pfnEmit, pUserData);
+        }
+
+    case ROLLER_ED_SURFACE_CLASS_ROOF:
+        iSurfaceFlags = TrakColour[iCurrent][TRAK_COLOUR_ROOF];
+        if (iSurfaceFlags == -1
+                || !TrakColour[iCurrent][TRAK_COLOUR_LEFT_WALL]
+                || !TrakColour[iCurrent][TRAK_COLOUR_RIGHT_WALL])
+            return true;
+        if (iSurfaceFlags < 0) {
+            int iSingleFlags = track_surface_render_flags(
+                -iSurfaceFlags, TEX_OFF_GROUND_TEXTURES,
+                bApplyRenderToggles);
+            const tGroundPt *pGround = &GroundPt[iNext];
+            const int aiPoint[ED_SURFACE_VERTEX_COUNT] = { 1, 4, 5, 0 };
+            for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+                const tVec3 *pPoint = &pGround->pointAy[aiPoint[i]];
+                aVertices[i].x = pPoint->fX;
+                aVertices[i].y = pPoint->fY;
+                aVertices[i].z = pPoint->fZ;
+                aVertices[i].u = 0;
+                aVertices[i].v = 0;
+            }
+            if (!emit_track_raw_surface(
+                    aVertices, (uint32_t)iNext, uiChunkId,
+                    unSurfaceClass,
+                    iSingleFlags, 5, false, pfnEmit, pUserData))
+                return false;
+        }
+        {
+            int iNextRoof = TrakColour[iNext][TRAK_COLOUR_ROOF];
+            if (iNextRoof < -1) {
+                int iSingleFlags = track_surface_render_flags(
+                    -iNextRoof, TEX_OFF_GROUND_TEXTURES,
+                    bApplyRenderToggles);
+                const tGroundPt *pGround = &GroundPt[iCurrent];
+                const int aiPoint[ED_SURFACE_VERTEX_COUNT] = { 4, 1, 0, 5 };
+                for (uint32_t i = 0; i < ED_SURFACE_VERTEX_COUNT; i++) {
+                    const tVec3 *pPoint = &pGround->pointAy[aiPoint[i]];
+                    aVertices[i].x = pPoint->fX;
+                    aVertices[i].y = pPoint->fY;
+                    aVertices[i].z = pPoint->fZ;
+                    aVertices[i].u = 0;
+                    aVertices[i].v = 0;
+                }
+                if (!emit_track_raw_surface(
+                        aVertices, uiChunkId, uiChunkId,
+                        unSurfaceClass,
+                        iSingleFlags, 5, false, pfnEmit, pUserData))
+                    return false;
+            }
+        }
+        iSurfaceFlags = track_surface_render_flags(
+            iSurfaceFlags, TEX_OFF_WALL_TEXTURES, bApplyRenderToggles);
+        world_verts_cross_first(
+            aVertices, TrakPt, iNext, iCurrent, 1, 5);
+        return emit_track_raw_surface(
+            aVertices, uiChunkId, uiChunkId,
+            unSurfaceClass,
+            iSurfaceFlags | SURFACE_FLAG_FLIP_BACKFACE,
+            5, false, pfnEmit, pUserData);
+
+    case ROLLER_ED_SURFACE_CLASS_OUTER_WALL_FLOOR:
+        iSurfaceFlags = GroundColour[iCurrent][GROUND_COLOUR_OFLOOR];
+        if (iSurfaceFlags == -1 || iSurfaceFlags == -2
+                || GroundColour[iNext][GROUND_COLOUR_OFLOOR] == -1)
+            return true;
+        iSurfaceFlags = track_surface_render_flags(
+            iSurfaceFlags, TEX_OFF_GROUND_TEXTURES, bApplyRenderToggles);
+        world_verts_ground_cross_first(
+            aVertices, iNext, iCurrent, 3, 2);
+        return emit_track_raw_surface(
+            aVertices, uiChunkId, uiChunkId,
+            unSurfaceClass, iSurfaceFlags,
+            8, false, pfnEmit, pUserData);
+
+    case ROLLER_ED_SURFACE_CLASS_LEFT_UPPER_OUTER_WALL:
+    case ROLLER_ED_SURFACE_CLASS_LEFT_LOWER_OUTER_WALL:
+    case ROLLER_ED_SURFACE_CLASS_RIGHT_UPPER_OUTER_WALL:
+    case ROLLER_ED_SURFACE_CLASS_RIGHT_LOWER_OUTER_WALL:
+        if (GroundColour[iCurrent][GROUND_COLOUR_OFLOOR] == -1
+                || GroundColour[iNext][GROUND_COLOUR_OFLOOR] == -1)
+            return true;
+        {
+            int iColourIndex;
+            int iPointA;
+            int iPointB;
+            int iSubdivideIndex;
+            if (unSurfaceClass
+                    == ROLLER_ED_SURFACE_CLASS_LEFT_UPPER_OUTER_WALL) {
+                iColourIndex = GROUND_COLOUR_LUOWALL;
+                iPointA = 0; iPointB = 1; iSubdivideIndex = 6;
+            } else if (unSurfaceClass
+                    == ROLLER_ED_SURFACE_CLASS_LEFT_LOWER_OUTER_WALL) {
+                iColourIndex = GROUND_COLOUR_LLOWALL;
+                iPointA = 1; iPointB = 2; iSubdivideIndex = 7;
+            } else if (unSurfaceClass
+                    == ROLLER_ED_SURFACE_CLASS_RIGHT_UPPER_OUTER_WALL) {
+                iColourIndex = GROUND_COLOUR_RUOWALL;
+                iPointA = 4; iPointB = 5; iSubdivideIndex = 10;
+            } else {
+                iColourIndex = GROUND_COLOUR_RLOWALL;
+                iPointA = 3; iPointB = 4; iSubdivideIndex = 9;
+            }
+            iSurfaceFlags = GroundColour[iCurrent][iColourIndex];
+            if (iSurfaceFlags == -1)
+                return true;
+            if (unSurfaceClass
+                    == ROLLER_ED_SURFACE_CLASS_LEFT_LOWER_OUTER_WALL
+                    && iSurfaceFlags == 65854)
+                iSurfaceFlags++;
+            iSurfaceFlags = track_surface_render_flags(
+                iSurfaceFlags, TEX_OFF_GROUND_TEXTURES,
+                bApplyRenderToggles);
+            world_verts_ground_forward(
+                aVertices, iNext, iCurrent, iPointA, iPointB);
+            return emit_track_raw_surface(
+                aVertices, uiChunkId, uiChunkId,
+                unSurfaceClass, iSurfaceFlags,
+                iSubdivideIndex, false, pfnEmit, pUserData);
+        }
+    default:
+        return false;
+    }
+}
+
+/* Shared by both canonical producers -- the full-track chunk walk and the
+ * full-scenery object walk -- so they intern materials into the same table. */
+typedef struct
+{
+    tEdMaterialTable *pMaterials;
+    tEdEmitSurfaceFn pfnEmit;
+    void *pUserData;
+} tEdCanonicalEmitContext;
+
+static bool emit_canonical_raw_surface(
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    const tEdSurfaceInfo *pInfo,
+    void *pUserData)
+{
+    tEdCanonicalEmitContext *pContext = pUserData;
+    return emit_surface_to_consumer(
+        aVertices, pInfo, pContext->pMaterials,
+        pContext->pfnEmit, pContext->pUserData);
+}
+
+static bool emit_full_track_chunk(uint32_t uiChunkId, void *pUserData)
+{
+    static const uint16_t aunSurfaceClasses[] = {
+        ROLLER_ED_SURFACE_CLASS_CENTER,
+        ROLLER_ED_SURFACE_CLASS_LEFT_SHOULDER,
+        ROLLER_ED_SURFACE_CLASS_RIGHT_SHOULDER,
+        ROLLER_ED_SURFACE_CLASS_LEFT_WALL,
+        ROLLER_ED_SURFACE_CLASS_RIGHT_WALL,
+        ROLLER_ED_SURFACE_CLASS_ROOF,
+        ROLLER_ED_SURFACE_CLASS_OUTER_WALL_FLOOR,
+        ROLLER_ED_SURFACE_CLASS_LEFT_LOWER_OUTER_WALL,
+        ROLLER_ED_SURFACE_CLASS_RIGHT_LOWER_OUTER_WALL,
+        ROLLER_ED_SURFACE_CLASS_LEFT_UPPER_OUTER_WALL,
+        ROLLER_ED_SURFACE_CLASS_RIGHT_UPPER_OUTER_WALL,
+    };
+
+    for (uint32_t i = 0;
+            i < sizeof(aunSurfaceClasses) / sizeof(aunSurfaceClasses[0]);
+            i++) {
+        if (!emit_track_chunk_surface(
+                uiChunkId, aunSurfaceClasses[i], false,
+                emit_canonical_raw_surface, pUserData))
+            return false;
+    }
+    return true;
+}
+
+bool drawtrk3_emit_full_track(tEdMaterialTable *pMaterials,
+                              tEdEmitSurfaceFn pfnEmit,
+                              void *pUserData)
+{
+    tEdCanonicalEmitContext Context;
+
+    if (!pMaterials || !pfnEmit
+            || TRAK_LEN <= 0 || TRAK_LEN > MAX_TRACK_CHUNKS)
+        return false;
+    Context.pMaterials = pMaterials;
+    Context.pfnEmit = pfnEmit;
+    Context.pUserData = pUserData;
+    return ed_traverse_full_track_chunks(
+        (uint32_t)TRAK_LEN, emit_full_track_chunk, &Context);
+}
+
+/*
+ * E4A-S6. The scenery counterpart of emit_full_track_chunk: every polygon of
+ * one placed building, in the plan's own order and its authored vertex order,
+ * placed at the yaw/pitch/roll the track file recorded.
+ *
+ * Two draw-time decisions are deliberately not made here, both because they
+ * need a viewer. building.c reverses the vertex order of a back-facing
+ * FLIP_BACKFACE quad; the authored order is canonical instead, and
+ * FLIP_BACKFACE already publishes ROLLER_ED_SURFACE_FLAG_TWO_SIDED, so an
+ * exporter draws those quads from both sides and loses nothing. building.c
+ * also turns billboard plans to face the viewer through worlddirn; the
+ * authored yaw is canonical instead. ADR 0005 records both.
+ */
+static bool emit_full_scenery_object(uint32_t uiBuildingIdx, void *pUserData)
+{
+    const tEdCanonicalEmitContext *pContext = pUserData;
+    tVec3 aWorld[BUILDING_MAX_PLAN_COORDS];
+    const tBuildingPlan *pPlan;
+    unsigned int uiBuildingType;
+    uint32_t uiCoordCount;
+
+    uiBuildingType = (unsigned int)BuildingBase[uiBuildingIdx][0];
+    /* InitBuildings placed nothing for an out-of-range plan, so BuildingX/Y/Z
+     * hold no position for it. Skipping matches what the renderer draws. */
+    if (uiBuildingType >= BUILDING_PLAN_COUNT)
+        return true;
+
+    uiCoordCount = building_transform_plan_coords(
+        (int)uiBuildingIdx, BUILDING_YAW_AUTHORED, aWorld);
+    if (!uiCoordCount)
+        return true;
+
+    pPlan = &BuildingPlans[uiBuildingType];
+    for (uint32_t i = 0; i < (uint32_t)pPlan->byNumPols; i++) {
+        const tPolygon *pPolygon = &pPlan->pPols[i];
+        GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT];
+        tEdSurfaceInfo Info;
+
+        if (!building_polygon_surface_info(
+                (int)uiBuildingIdx, pPolygon, false, &Info))
+            return false;
+        /* The canonical stream is authored content only. E4A-S3's
+         * classification is the authority on which surfaces those are, and it
+         * is made per polygon, not per plan: a billboard whose polygon is a
+         * real advert panel is AUTHORED_SIGN and does travel. */
+        if (Info.unContentClass == ROLLER_ED_CONTENT_RUNTIME_SCENERY)
+            continue;
+        /* Retail TRACK5 names an advert tile past the end of its building
+         * bank. The renderer drops that quad; so does this, rather than
+         * failing the whole extraction over one bad advert entry. */
+        if (!ed_surface_material_resolvable(pContext->pMaterials, &Info))
+            continue;
+        for (uint32_t v = 0; v < ED_SURFACE_VERTEX_COUNT; v++) {
+            uint32_t uiCoord = pPolygon->verts[v];
+
+            if (uiCoord >= uiCoordCount)
+                return false;
+            aVertices[v].x = aWorld[uiCoord].fX;
+            aVertices[v].y = aWorld[uiCoord].fY;
+            aVertices[v].z = aWorld[uiCoord].fZ;
+            aVertices[v].u = 0.0f;
+            aVertices[v].v = 0.0f;
+        }
+        if (!emit_canonical_raw_surface(aVertices, &Info, pUserData))
+            return false;
+    }
+    return true;
+}
+
+bool drawtrk3_emit_full_scenery(tEdMaterialTable *pMaterials,
+                                tEdEmitSurfaceFn pfnEmit,
+                                void *pUserData)
+{
+    tEdCanonicalEmitContext Context;
+
+    if (!pMaterials || !pfnEmit
+            || NumBuildings < 0 || NumBuildings > MAX_VISIBLE_BUILDINGS)
+        return false;
+    Context.pMaterials = pMaterials;
+    Context.pfnEmit = pfnEmit;
+    Context.pUserData = pUserData;
+    return ed_traverse_full_scenery_objects(
+        (uint32_t)NumBuildings, emit_full_scenery_object, &Context);
+}
+
+typedef struct
+{
+    GameRenderer *pRenderer;
+} tEdTrackRenderContext;
+
+static bool emit_track_raw_surface_to_renderer(
+    const GameRenderVertex aVertices[ED_SURFACE_VERTEX_COUNT],
+    const tEdSurfaceInfo *pInfo,
+    void *pUserData)
+{
+    tEdTrackRenderContext *pContext = pUserData;
+    return drawtrk3_emit_surface_to_renderer(
+        pContext->pRenderer, aVertices, pInfo);
+}
+
+static bool emit_track_chunk_surface_to_renderer(
+    GameRenderer *pRenderer,
+    uint32_t uiChunkId,
+    uint16_t unSurfaceClass)
+{
+    tEdTrackRenderContext Context;
+#if defined(ROLLER_EDITOR_CORE)
+    if (!roller_ed_overlay_track_segment_visible(
+            uiChunkId, (uint32_t)TRAK_LEN))
+        return true;
+#endif
+    Context.pRenderer = pRenderer;
+    return emit_track_chunk_surface(
+        uiChunkId, unSurfaceClass, true,
+        emit_track_raw_surface_to_renderer, &Context);
 }
 
 static void draw_start_light_cube_world(GameRenderer *renderer,
@@ -607,6 +1651,138 @@ int CalcVisibleTrack(int iCarIdx, unsigned int uiViewMode)
   start_sect = result;
   return result;
 }
+
+#if defined(ROLLER_EDITOR_CORE)
+//-------------------------------------------------------------------------------------------------
+// Editor visibility has no car anchor. Find the closest section to the
+// explicit facade camera across the complete track, then initialize a
+// gap-free legacy range in the direction the camera faces. As in the game,
+// draw distance 0 preserves the track-authored normal visibility window and
+// higher values interpolate from there toward the whole circuit.
+int CalcVisibleTrackEditor(unsigned int uiViewMode)
+{
+  double dMinDistanceSquared = DBL_MAX;
+  double dTrackX = 0.0;
+  double dTrackY = 0.0;
+  double dTrackLengthSquared = 0.0;
+  float fViewAlignment = 1.0f;
+  int iCurrChunk = -1;
+  int iViewOffset;
+
+  set_starts(0);
+
+  if (TRAK_LEN <= 0 || TRAK_LEN > MAX_TRACK_CHUNKS) {
+    TrackSize = -1;
+    start_sect = 0;
+    first_size = -1;
+    gap_size = 0;
+    next_front = -1;
+    mid_sec = -1;
+    front_sec = 0;
+    back_sec = 0;
+    backwards = 0;
+    alltrackflag = 0;
+    return -1;
+  }
+
+  for (int iChunk = 0; iChunk < TRAK_LEN; ++iChunk) {
+    const tVec3 *pCenter = &localdata[iChunk].pointAy[3];
+    double dDeltaX = -(double)pCenter->fX - (double)viewx;
+    double dDeltaY = -(double)pCenter->fY - (double)viewy;
+    double dDeltaZ = -(double)pCenter->fZ - (double)viewz;
+    double dDistanceSquared = dDeltaX * dDeltaX
+                            + dDeltaY * dDeltaY
+                            + dDeltaZ * dDeltaZ;
+
+    if (dDistanceSquared < dMinDistanceSquared) {
+      dMinDistanceSquared = dDistanceSquared;
+      iCurrChunk = iChunk;
+    }
+  }
+
+  // Prefer the local forward tangent. If adjacent section centers coincide,
+  // continue around the circuit until a usable horizontal direction exists.
+  for (int iStep = 1; iStep < TRAK_LEN; ++iStep) {
+    int iNextChunk = iCurrChunk + iStep;
+    if (iNextChunk >= TRAK_LEN)
+      iNextChunk -= TRAK_LEN;
+    dTrackX = (double)localdata[iCurrChunk].pointAy[3].fX
+            - (double)localdata[iNextChunk].pointAy[3].fX;
+    dTrackY = (double)localdata[iCurrChunk].pointAy[3].fY
+            - (double)localdata[iNextChunk].pointAy[3].fY;
+    dTrackLengthSquared = dTrackX * dTrackX + dTrackY * dTrackY;
+    if (dTrackLengthSquared > 0.000001)
+      break;
+  }
+
+  if (dTrackLengthSquared > 0.000001) {
+    fViewAlignment = (float)(
+        (dTrackX * (double)tcos[worlddirn]
+       + dTrackY * (double)tsin[worlddirn])
+        / sqrt(dTrackLengthSquared));
+  }
+
+  backwards = fViewAlignment < 0.0f ? -1 : 0;
+  switch (uiViewMode) {
+    case 2u: iViewOffset = -4; break;
+    case 3u: iViewOffset = -8; break;
+    case 4u: iViewOffset = -16; break;
+    case 6u: iViewOffset = -4; break;
+    default: iViewOffset = -1; break;
+  }
+
+  if (fViewAlignment < 0.3f && fViewAlignment >= -0.3f
+      && ((TrakColour[iCurrChunk][TRAK_COLOUR_LEFT_LANE]
+              & SURFACE_FLAG_SKIP_RENDER) == 0
+          || (TrakColour[iCurrChunk][TRAK_COLOUR_CENTER]
+              & SURFACE_FLAG_SKIP_RENDER) == 0
+          || (TrakColour[iCurrChunk][TRAK_COLOUR_RIGHT_LANE]
+              & SURFACE_FLAG_SKIP_RENDER) == 0)) {
+    if (uiViewMode == 3u || uiViewMode == 6u)
+      TrackSize = 48;
+    else
+      TrackSize = 24;
+  } else if (backwards) {
+    TrackSize = TrakView[iCurrChunk].byBackwardMainChunks - iViewOffset;
+  } else {
+    TrackSize = TrakView[iCurrChunk].byForwardMainChunks - iViewOffset;
+  }
+
+  if (TrackSize < 0)
+    TrackSize = 0;
+  if (TrackSize > TRAK_LEN - 1)
+    TrackSize = TRAK_LEN - 1;
+  if (g_fDrawDistanceFraction >= 1.0f) {
+    TrackSize = TRAK_LEN - 1;
+  } else if (g_fDrawDistanceFraction > 0.0f
+             && TrackSize < TRAK_LEN - 1) {
+    TrackSize += (int)(g_fDrawDistanceFraction
+        * (float)((TRAK_LEN - 1) - TrackSize));
+  }
+  first_size = TrackSize;
+  gap_size = 6 * TRAK_LEN;
+  next_front = -1;
+  mid_sec = -1;
+  alltrackflag = g_fDrawDistanceFraction >= 1.0f ? -1 : 0;
+  test_y1 = iCurrChunk;
+
+  if (backwards) {
+    front_sec = iCurrChunk;
+    back_sec = iCurrChunk - TrackSize;
+    if (back_sec < 0)
+      back_sec += TRAK_LEN;
+    start_sect = back_sec;
+  } else {
+    front_sec = iCurrChunk;
+    back_sec = iCurrChunk + TrackSize;
+    if (back_sec >= TRAK_LEN)
+      back_sec -= TRAK_LEN;
+    start_sect = front_sec;
+  }
+
+  return iCurrChunk;
+}
+#endif
 
 //-------------------------------------------------------------------------------------------------
 //0001DE40
@@ -2216,7 +3392,10 @@ LABEL_393:
                                  pVisibleBuildingsPtr->fDepth);
     ++pVisibleBuildingsPtr;
   }
-  if (countdown > -72 && replaytype != 2 && game_type != 2 && !winner_mode)// Process starting lights for rendering (if countdown active)
+  /* SLight is the transient three-cube race-start countdown display, not
+   * scene illumination. The track editor never renders it. */
+  if (!roller_ed_track_only_active()
+      && countdown > -72 && replaytype != 2 && game_type != 2 && !winner_mode)// Process starting lights for rendering (if countdown active)
   {
     iLightIndex = 0;
     do {
@@ -2259,55 +3438,15 @@ LABEL_393:
       switch (pRenderCommand->nRenderPriority) {
         case RENDER_QUEUE_3D_LEFT_WALL_LEGACY_PRIORITY:
         case RENDER_QUEUE_3D_LEFT_HIGH_WALL_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_LEFT_WALL];
-            int highWall = (sf < 0);
-            if (highWall) sf = -sf;
-            sf |= SURFACE_FLAG_FLIP_BACKFACE;
-            if ((textures_off & TEX_OFF_WALL_TEXTURES) != 0) {
-              if (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                sf = remap_surface_to_flat(sf);
-              else
-                sf = SURFACE_FLAG_SKIP_RENDER;
-            } else if ((textures_off & TEX_OFF_GLASS_WALLS) != 0 && (sf & SURFACE_FLAG_TRANSPARENT) != 0) {
-              sf = SURFACE_FLAG_SKIP_RENDER;
-            }
-            if ((sf & SURFACE_FLAG_SKIP_RENDER) == 0) {
-              GameRenderVertex v[4];
-              world_verts_left_wall(v, iNextSectionIndex, iSectionNum, highWall ? 2 : 0);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[3] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_LEFT_WALL);
           goto LABEL_1271;
         case RENDER_QUEUE_3D_RIGHT_WALL_LEGACY_PRIORITY:
         case RENDER_QUEUE_3D_RIGHT_HIGH_WALL_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_RIGHT_WALL];
-            int highWall = (sf < 0);
-            if (highWall) sf = -sf;
-            sf |= SURFACE_FLAG_FLIP_BACKFACE;
-            if ((textures_off & TEX_OFF_WALL_TEXTURES) != 0) {
-              if (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                sf = remap_surface_to_flat(sf);
-              else
-                sf = SURFACE_FLAG_SKIP_RENDER;
-            } else if ((textures_off & TEX_OFF_GLASS_WALLS) != 0 && (sf & SURFACE_FLAG_TRANSPARENT) != 0) {
-              sf = SURFACE_FLAG_SKIP_RENDER;
-            }
-            if ((sf & SURFACE_FLAG_SKIP_RENDER) == 0) {
-              GameRenderVertex v[4];
-              world_verts_right_wall(v, iNextSectionIndex, iSectionNum, highWall ? 3 : 4);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[4] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_RIGHT_WALL);
           goto LABEL_1271;
         LABEL_1271:
           if (++iRenderObjectIndex >= iRenderQueueCount)
@@ -2315,7 +3454,6 @@ LABEL_393:
           break;
         case RENDER_QUEUE_3D_GROUND_LEGACY_PRIORITY:
           {
-            int sf = GroundColour[iSectionNum][GROUND_COLOUR_OFLOOR];
             if (!facing_ok(
               pNextGroundScreen->screenPtAy[2].projected.fX,
               pNextGroundScreen->screenPtAy[2].projected.fY,
@@ -2330,17 +3468,9 @@ LABEL_393:
               pNextGroundScreen->screenPtAy[3].projected.fY,
               pNextGroundScreen->screenPtAy[3].projected.fZ))
               goto LABEL_1271;
-            if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_ground_cross_first(v, iNextSectionIndex, iSectionNum, 3, 2);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[8] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
+            emit_track_chunk_surface_to_renderer(
+                g_pGameRenderer, (uint32_t)iSectionNum,
+                ROLLER_ED_SURFACE_CLASS_OUTER_WALL_FLOOR);
           }
           goto LABEL_1271;
         case RENDER_QUEUE_3D_LEFT_LOWER_WALL_LEGACY_PRIORITY:
@@ -2363,17 +3493,9 @@ LABEL_393:
               pNextGroundScreen->screenPtAy[1].projected.fZ)
               && (sf & SURFACE_FLAG_CONCAVE) == 0)
               goto LABEL_1068;
-            if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_ground_forward(v, iNextSectionIndex, iSectionNum, 0, 1);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[6] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
+            emit_track_chunk_surface_to_renderer(
+                g_pGameRenderer, (uint32_t)iSectionNum,
+                ROLLER_ED_SURFACE_CLASS_LEFT_UPPER_OUTER_WALL);
           }
           goto LABEL_1068;
         LABEL_1068:
@@ -2396,19 +3518,9 @@ LABEL_393:
               pNextGroundScreen->screenPtAy[2].projected.fZ)
               && (sf & SURFACE_FLAG_CONCAVE) == 0)
               goto LABEL_1271;
-            if (sf == 65854)
-              sf += 1;
-            if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_ground_forward(v, iNextSectionIndex, iSectionNum, 1, 2);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[7] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
+            emit_track_chunk_surface_to_renderer(
+                g_pGameRenderer, (uint32_t)iSectionNum,
+                ROLLER_ED_SURFACE_CLASS_LEFT_LOWER_OUTER_WALL);
           }
           goto LABEL_1271;
         case RENDER_QUEUE_3D_RIGHT_LOWER_WALL_LEGACY_PRIORITY:
@@ -2431,17 +3543,9 @@ LABEL_393:
               pNextGroundScreen->screenPtAy[5].projected.fZ)
               && (sf & SURFACE_FLAG_CONCAVE) == 0)
               goto LABEL_1174;
-            if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_ground_forward(v, iNextSectionIndex, iSectionNum, 4, 5);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[10] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
+            emit_track_chunk_surface_to_renderer(
+                g_pGameRenderer, (uint32_t)iSectionNum,
+                ROLLER_ED_SURFACE_CLASS_RIGHT_UPPER_OUTER_WALL);
           }
           goto LABEL_1174;
         LABEL_1174:
@@ -2464,137 +3568,32 @@ LABEL_393:
               pNextGroundScreen->screenPtAy[4].projected.fZ)
               && (sf & SURFACE_FLAG_CONCAVE) == 0)
               goto LABEL_1271;
-            if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_ground_forward(v, iNextSectionIndex, iSectionNum, 3, 4);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[9] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
+            emit_track_chunk_surface_to_renderer(
+                g_pGameRenderer, (uint32_t)iSectionNum,
+                ROLLER_ED_SURFACE_CLASS_RIGHT_LOWER_OUTER_WALL);
           }
           goto LABEL_1271;
         case RENDER_QUEUE_3D_ROAD_CENTER_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_CENTER];
-            if ((textures_off & TEX_OFF_ROAD_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_cross_first(v, TrakPt, iNextSectionIndex, iSectionNum, 3, 2);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[1] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_CENTER);
           goto LABEL_1271;
         LABEL_1203:
           goto LABEL_1271;
         case RENDER_QUEUE_3D_LEFT_LANE_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_LEFT_LANE];
-            if (sf < 0)
-              sf = -sf;
-            if ((textures_off & TEX_OFF_ROAD_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_cross_first(v, TrakPt, iNextSectionIndex, iSectionNum, 2, 0);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[0] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_LEFT_SHOULDER);
           goto LABEL_1271;
         case RENDER_QUEUE_3D_RIGHT_LANE_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_RIGHT_LANE];
-            if (sf < 0)
-              sf = -sf;
-            if ((textures_off & TEX_OFF_ROAD_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_cross_first(v, TrakPt, iNextSectionIndex, iSectionNum, 4, 3);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[2] * subscale;
-              game_render_quad_world(g_pGameRenderer, v, h, sf, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_RIGHT_SHOULDER);
           goto LABEL_1271;
         case RENDER_QUEUE_3D_ROOF_LEGACY_PRIORITY:
-          {
-            int sf = TrakColour[iSectionNum][TRAK_COLOUR_ROOF];
-            /* Single-section roof from NEXT section (negative surface type) */
-            if (sf < 0) {
-              int renderSf = -sf;
-              if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (renderSf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-                renderSf = remap_surface_to_flat(renderSf);
-              {
-                GameRenderVertex v[4];
-                tGroundPt *g = &GroundPt[iNextSectionIndex];
-                v[0].x = g->pointAy[1].fX; v[0].y = g->pointAy[1].fY; v[0].z = g->pointAy[1].fZ;
-                v[1].x = g->pointAy[4].fX; v[1].y = g->pointAy[4].fY; v[1].z = g->pointAy[4].fZ;
-                v[2].x = g->pointAy[5].fX; v[2].y = g->pointAy[5].fY; v[2].z = g->pointAy[5].fZ;
-                v[3].x = g->pointAy[0].fX; v[3].y = g->pointAy[0].fY; v[3].z = g->pointAy[0].fZ;
-                v[0].u = 0; v[0].v = 0; v[1].u = 0; v[1].v = 0;
-                v[2].u = 0; v[2].v = 0; v[3].u = 0; v[3].v = 0;
-                TextureHandle h = (renderSf & SURFACE_FLAG_APPLY_TEXTURE)
-                  ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                  : TEXTURE_HANDLE_INVALID;
-                float subT = (uint8)Subdivide[iSectionNum].subdivides[5] * subscale;
-                game_render_quad_world(g_pGameRenderer, v, h, renderSf, subT);
-              }
-            }
-            /* Single-section roof from CUR section (very negative surface) */
-            if (TrakColour[iSectionNum][TRAK_COLOUR_RIGHT_WALL]
-                && TrakColour[iSectionNum][TRAK_COLOUR_LEFT_WALL]) {
-              int idx = TrakColour[iNextSectionIndex][TRAK_COLOUR_ROOF];
-              if (idx < -1) {
-                int renderSf = -idx;
-                if ((textures_off & TEX_OFF_GROUND_TEXTURES) != 0 && (renderSf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-                  renderSf = remap_surface_to_flat(renderSf);
-                {
-                  GameRenderVertex v[4];
-                  tGroundPt *g = &GroundPt[iSectionNum];
-                  v[0].x = g->pointAy[4].fX; v[0].y = g->pointAy[4].fY; v[0].z = g->pointAy[4].fZ;
-                  v[1].x = g->pointAy[1].fX; v[1].y = g->pointAy[1].fY; v[1].z = g->pointAy[1].fZ;
-                  v[2].x = g->pointAy[0].fX; v[2].y = g->pointAy[0].fY; v[2].z = g->pointAy[0].fZ;
-                  v[3].x = g->pointAy[5].fX; v[3].y = g->pointAy[5].fY; v[3].z = g->pointAy[5].fZ;
-                  v[0].u = 0; v[0].v = 0; v[1].u = 0; v[1].v = 0;
-                  v[2].u = 0; v[2].v = 0; v[3].u = 0; v[3].v = 0;
-                  TextureHandle h = (renderSf & SURFACE_FLAG_APPLY_TEXTURE)
-                    ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                    : TEXTURE_HANDLE_INVALID;
-                  float subT = (uint8)Subdivide[iSectionNum].subdivides[5] * subscale;
-                  game_render_quad_world(g_pGameRenderer, v, h, renderSf, subT);
-                }
-              }
-            }
-            /* Two-section roof quad (TrakPt source, always rendered) */
-            if ((textures_off & TEX_OFF_WALL_TEXTURES) != 0 && (sf & SURFACE_FLAG_APPLY_TEXTURE) != 0)
-              sf = remap_surface_to_flat(sf);
-            {
-              GameRenderVertex v[4];
-              world_verts_cross_first(v, TrakPt, iNextSectionIndex, iSectionNum, 1, 5);
-              TextureHandle h = (sf & SURFACE_FLAG_APPLY_TEXTURE)
-                ? game_render_get_texture_handle(g_pGameRenderer, 0)
-                : TEXTURE_HANDLE_INVALID;
-              float subT = (uint8)Subdivide[iSectionNum].subdivides[5] * subscale;
-              /* FLIP_BACKFACE: roof underside is back-facing at shallow angles (same elevation as camera). */
-              game_render_quad_world(g_pGameRenderer, v, h,
-                                    sf | SURFACE_FLAG_FLIP_BACKFACE, subT);
-            }
-          }
+          emit_track_chunk_surface_to_renderer(
+              g_pGameRenderer, (uint32_t)iSectionNum,
+              ROLLER_ED_SURFACE_CLASS_ROOF);
           goto LABEL_1271;
         case 0xB:
           {
@@ -2683,47 +3682,8 @@ int facing_ok(float fX0, float fY0, float fZ0,
 //00027A60
 void set_starts(unsigned int uiType)
 {
-  startsx[1] = 0;
-  startsx[2] = 0;
-  startsy[0] = 0;
-  startsy[1] = 0;
-  if (gfx_size) {
-    if (uiType) {
-      if (uiType <= 1) {
-        startsx[0] = 0x3FF000; //64.0
-        startsx[3] = 0x3FF000; //64.0
-        startsy[2] = 0x1FF000; //31.875
-        startsy[3] = 0x1FF000; //31.875
-      } else if (uiType == 2) {
-        startsx[0] = 0x1FF000; //31.875
-        startsx[3] = 0x1FF000; //31.875
-        startsy[2] = 0x3FF000; //64.0
-        startsy[3] = 0x3FF000; //64.0
-      }
-    } else {
-      startsx[0] = 0x1FF000; //31.875
-      startsx[3] = 0x1FF000; //31.875
-      startsy[2] = 0x1FF000; //31.875
-      startsy[3] = 0x1FF000; //31.875
-    }
-  } else if (uiType) {
-    if (uiType <= 1) {
-      startsx[0] = 0x7FF000; //128.0
-      startsx[3] = 0x7FF000; //128.0
-      startsy[2] = 0x3FF000; //64.0
-      startsy[3] = 0x3FF000; //64.0
-    } else if (uiType == 2) {
-      startsx[0] = 0x3FF000; //64.0
-      startsx[3] = 0x3FF000; //64.0
-      startsy[2] = 0x7FF000; //128.0
-      startsy[3] = 0x7FF000; //128.0
-    }
-  } else {
-    startsx[0] = 0x3FF000; //64.0
-    startsx[3] = 0x3FF000; //64.0
-    startsy[2] = 0x3FF000; //64.0
-    startsy[3] = 0x3FF000; //64.0
-  }
+  ed_surface_compute_render_uvs(
+      (uint8_t)uiType, gfx_size != 0, startsx, startsy);
 }
 
 //-------------------------------------------------------------------------------------------------

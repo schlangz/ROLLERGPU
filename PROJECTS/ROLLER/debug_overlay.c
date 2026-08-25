@@ -1,6 +1,12 @@
 #include "debug_overlay.h"
+#include "types.h"
+#if defined(IS_WASM)
+#include "nuklear_sdl_renderer.h"
+#include "present_sdlrenderer.h"
+#else
 #include "debug_overlay_shaders.h"
 #include "crt_filter.h"
+#endif
 #include "frontend.h"
 #include "roller.h"
 #include "rollerinput.h"
@@ -21,6 +27,7 @@
 #define NK_INCLUDE_DEFAULT_ALLOCATOR
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_DEFAULT_FONT
+#define NK_INCLUDE_VERTEX_BUFFER_OUTPUT
 #define NK_ZERO_COMMAND_MEMORY
 #define NK_IMPLEMENTATION
 #include "nuklear.h"
@@ -32,36 +39,32 @@
 #define OVERLAY_BPP      4    // RGBA
 #define OVERLAY_ASPECT   ((float)OVERLAY_W / (float)OVERLAY_H)
 
-#define MAX_LOG_MESSAGES 512
-#define MAX_LOG_LEN      256
-
-#define OVERLAY_FONT_SIZE 24.0f
+#define OVERLAY_FONT_SIZE 28.0f
 #define PANEL_MARGIN     10
-#define DEBUG_ROW_H      30
+#define DEBUG_ROW_H      34
 #define COMBO_ITEM_H     (DEBUG_ROW_H + 4)
 #define COMBO_W          190
-#define DEBUG_SPACING_H  12
 #define HINT_H           42
 #define PANEL_Y          (PANEL_MARGIN + HINT_H + PANEL_MARGIN)
 #define PANEL_H          (OVERLAY_H - PANEL_Y - PANEL_MARGIN)
-#define LEFT_W           410
-#define RIGHT_X          (PANEL_MARGIN + LEFT_W + PANEL_MARGIN)
-#define RIGHT_W          (OVERLAY_W - RIGHT_X - PANEL_MARGIN)
-#define LOG_ROW_H        DEBUG_ROW_H
+#define PANEL_FULL_W      (OVERLAY_W - PANEL_MARGIN * 2)
+#define PANEL_COLUMN_W    ((OVERLAY_W - PANEL_MARGIN * 3) / 2)
+#define GRAPHICS_PANEL_X  (PANEL_MARGIN * 2 + PANEL_COLUMN_W)
 #define TOUCH_GESTURE_THRESHOLD 24.0f
 #define TOUCH_SCROLL_PIXELS_PER_STEP 72.0f
 
-typedef struct {
-  char szText[MAX_LOG_LEN];
-} tLogEntry;
-
 struct DebugOverlay {
+#if defined(IS_WASM)
+  NuklearSDLRenderer    *pSDLRenderer;
+#else
   SDL_GPUDevice         *pDevice;
+#endif
   SDL_Window            *pWindow;
   bool                   bVisible;
 
   struct nk_context      nk;
   struct nk_font_atlas   atlas;
+#if !defined(IS_WASM)
   int                    iAtlasW;
   int                    iAtlasH;
   uint8_t               *pAtlasPixels; // owned RGBA copy
@@ -71,18 +74,11 @@ struct DebugOverlay {
   SDL_GPUTransferBuffer *pTransfer;
   SDL_GPUGraphicsPipeline *pPipeline;
   SDL_GPUSampler          *pSampler;
+#endif
 
-  // Log ring buffer
-  tLogEntry              aLogEntries[MAX_LOG_MESSAGES];
-  int                    iLogHead;     // index of oldest entry
-  int                    iLogCount;
-  SDL_Mutex             *pLogMutex;
-
-  // Chained SDL log function
-  SDL_LogOutputFunction  pPrevLogFn;
-  void                  *pPrevLogUserdata;
-
+#if !defined(IS_WASM)
   uint32_t               uLastCmdHash; // FNV-1a of Nuklear command buffer; 0 = force rasterize
+#endif
 
   bool                   bInputBegun;
   bool                   bTouchActive;
@@ -103,8 +99,6 @@ struct DebugOverlay {
   SDL_FingerID           ullDismissFingerId;
   SDL_MouseID            uiDismissMouseId;
   Uint8                  byDismissMouseButton;
-  bool                   bHideLog;
-
 };
 
 // ---------------------------------------------------------------------------
@@ -163,50 +157,10 @@ void debug_overlay_pick_outline_set(bool active, const float nx[4], const float 
 }
 
 // ---------------------------------------------------------------------------
-// Log callback
-// ---------------------------------------------------------------------------
-
-static const char *PriorityPrefix(SDL_LogPriority priority) {
-  switch (priority) {
-  case SDL_LOG_PRIORITY_VERBOSE:  return "[VRB] ";
-  case SDL_LOG_PRIORITY_DEBUG:    return "[DBG] ";
-  case SDL_LOG_PRIORITY_INFO:     return "[INF] ";
-  case SDL_LOG_PRIORITY_WARN:     return "[WRN] ";
-  case SDL_LOG_PRIORITY_ERROR:    return "[ERR] ";
-  case SDL_LOG_PRIORITY_CRITICAL: return "[CRT] ";
-  default:                        return "      ";
-  }
-}
-
-static void LogCallback(void *pUserdata, int iCategory, SDL_LogPriority priority,
-                         const char *pMessage) {
-  DebugOverlay *pOverlay = (DebugOverlay *)pUserdata;
-
-  // Chain to previous handler so console output is preserved
-  if (pOverlay->pPrevLogFn)
-    pOverlay->pPrevLogFn(pOverlay->pPrevLogUserdata, iCategory, priority, pMessage);
-
-  SDL_LockMutex(pOverlay->pLogMutex);
-
-  int iIdx;
-  if (pOverlay->iLogCount < MAX_LOG_MESSAGES) {
-    iIdx = (pOverlay->iLogHead + pOverlay->iLogCount) % MAX_LOG_MESSAGES;
-    pOverlay->iLogCount++;
-  } else {
-    iIdx = pOverlay->iLogHead;
-    pOverlay->iLogHead = (pOverlay->iLogHead + 1) % MAX_LOG_MESSAGES;
-  }
-
-  snprintf(pOverlay->aLogEntries[iIdx].szText, MAX_LOG_LEN,
-           "%s%s", PriorityPrefix(priority), pMessage);
-
-  SDL_UnlockMutex(pOverlay->pLogMutex);
-}
-
-// ---------------------------------------------------------------------------
 // Software rasterizer helpers
 // ---------------------------------------------------------------------------
 
+#if !defined(IS_WASM)
 static void OverlayFillRect(uint8_t *pBuf, int iBx, int iBy, int iBw, int iBh,
                      struct nk_color c) {
   for (int iY = iBy; iY < iBy + iBh; iY++) {
@@ -398,11 +352,13 @@ static void UploadAndBlit(DebugOverlay *pOverlay, SDL_GPUCommandBuffer *pCmdBuf)
   SDL_UploadToGPUTexture(pCp, &src, &dst, false);
   SDL_EndGPUCopyPass(pCp);
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+#if !defined(IS_WASM)
 static SDL_GPUShader *LoadOverlayShader(SDL_GPUDevice *pDevice, SDL_GPUShaderStage stage,
     const unsigned char *pSpirv, unsigned int uiSpirvSize,
     const unsigned char *pMsl, unsigned int uiMslSize,
@@ -427,11 +383,19 @@ static SDL_GPUShader *LoadOverlayShader(SDL_GPUDevice *pDevice, SDL_GPUShaderSta
   }
   return SDL_CreateGPUShader(pDevice, &info);
 }
+#endif
 
 DebugOverlay *debug_overlay_create(SDL_GPUDevice *pDevice, SDL_Window *pWindow) {
   DebugOverlay *pOverlay = calloc(1, sizeof(DebugOverlay));
+  int iAtlasW = 0;
+  int iAtlasH = 0;
+
   if (!pOverlay) return NULL;
+#if defined(IS_WASM)
+  (void)pDevice;
+#else
   pOverlay->pDevice     = pDevice;
+#endif
   pOverlay->pWindow     = pWindow;
   pOverlay->bVisible    = false;
 
@@ -441,14 +405,30 @@ DebugOverlay *debug_overlay_create(SDL_GPUDevice *pDevice, SDL_Window *pWindow) 
                                                     OVERLAY_FONT_SIZE, NULL);
 
   const void *pBaked = nk_font_atlas_bake(&pOverlay->atlas,
-                                           &pOverlay->iAtlasW, &pOverlay->iAtlasH,
+                                           &iAtlasW, &iAtlasH,
                                            NK_FONT_ATLAS_RGBA32);
-  size_t uiAtlasBytes = (size_t)(pOverlay->iAtlasW * pOverlay->iAtlasH * 4);
+#if defined(IS_WASM)
+  pOverlay->pSDLRenderer = nuklear_sdl_renderer_create(
+      ROLLERPresentSDLRendererGetRenderer());
+  if (!pOverlay->pSDLRenderer ||
+      !nuklear_sdl_renderer_finish_font_atlas(
+          pOverlay->pSDLRenderer, &pOverlay->atlas, pBaked,
+          iAtlasW, iAtlasH)) {
+    nuklear_sdl_renderer_destroy(pOverlay->pSDLRenderer);
+    nk_font_atlas_clear(&pOverlay->atlas);
+    free(pOverlay);
+    return NULL;
+  }
+#else
+  pOverlay->iAtlasW = iAtlasW;
+  pOverlay->iAtlasH = iAtlasH;
+  size_t uiAtlasBytes = (size_t)(iAtlasW * iAtlasH * 4);
   pOverlay->pAtlasPixels = malloc(uiAtlasBytes);
   memcpy(pOverlay->pAtlasPixels, pBaked, uiAtlasBytes);
 
   struct nk_draw_null_texture nullTex = {0};
   nk_font_atlas_end(&pOverlay->atlas, nk_handle_ptr(pOverlay->pAtlasPixels), &nullTex);
+#endif
   nk_init_default(&pOverlay->nk, &pFont->handle);
 
   // Make window and group backgrounds translucent (~80% opacity)
@@ -464,10 +444,11 @@ DebugOverlay *debug_overlay_create(SDL_GPUDevice *pDevice, SDL_Window *pWindow) 
   pStyle->checkbox.cursor_hover        = nk_style_item_color(nk_rgba(255, 255, 255, 255));
   pStyle->combo.content_padding        = nk_vec2(4, 0);
   pStyle->combo.border                 = 0;
-#if defined(IS_ANDROID)
+#if defined(IS_ANDROID) || defined(IS_WASM)
   pStyle->window.scrollbar_size        = nk_vec2(24, 24);
 #endif
 
+#if !defined(IS_WASM)
   pOverlay->pPixels = calloc(1, OVERLAY_W * OVERLAY_H * OVERLAY_BPP);
 
   SDL_GPUTextureCreateInfo ti = {0};
@@ -484,11 +465,9 @@ DebugOverlay *debug_overlay_create(SDL_GPUDevice *pDevice, SDL_Window *pWindow) 
   tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
   tbi.size  = OVERLAY_W * OVERLAY_H * OVERLAY_BPP;
   pOverlay->pTransfer = SDL_CreateGPUTransferBuffer(pDevice, &tbi);
+#endif
 
-  pOverlay->pLogMutex = SDL_CreateMutex();
-  SDL_GetLogOutputFunction(&pOverlay->pPrevLogFn, &pOverlay->pPrevLogUserdata);
-  SDL_SetLogOutputFunction(LogCallback, pOverlay);
-
+#if !defined(IS_WASM)
   // Build alpha-blend pipeline for compositing overlay over swapchain
   SDL_GPUShader *pVert = LoadOverlayShader(pDevice, SDL_GPU_SHADERSTAGE_VERTEX,
     overlay_vertex_spirv, overlay_vertex_spirv_size,
@@ -532,16 +511,18 @@ DebugOverlay *debug_overlay_create(SDL_GPUDevice *pDevice, SDL_Window *pWindow) 
   si.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
   si.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
   pOverlay->pSampler = SDL_CreateGPUSampler(pDevice, &si);
+#endif
 
   return pOverlay;
 }
 
 void debug_overlay_destroy(DebugOverlay *pOverlay) {
   if (!pOverlay) return;
-  SDL_SetLogOutputFunction(pOverlay->pPrevLogFn, pOverlay->pPrevLogUserdata);
-  SDL_DestroyMutex(pOverlay->pLogMutex);
   nk_free(&pOverlay->nk);
   nk_font_atlas_clear(&pOverlay->atlas);
+#if defined(IS_WASM)
+  nuklear_sdl_renderer_destroy(pOverlay->pSDLRenderer);
+#else
   free(pOverlay->pAtlasPixels);
   free(pOverlay->pPixels);
   SDL_ReleaseGPUTexture(pOverlay->pDevice, pOverlay->pTexture);
@@ -550,6 +531,7 @@ void debug_overlay_destroy(DebugOverlay *pOverlay) {
     SDL_ReleaseGPUGraphicsPipeline(pOverlay->pDevice, pOverlay->pPipeline);
   if (pOverlay->pSampler)
     SDL_ReleaseGPUSampler(pOverlay->pDevice, pOverlay->pSampler);
+#endif
   free(pOverlay);
 }
 
@@ -939,7 +921,7 @@ static void DrawHintPanel(DebugOverlay *pOverlay) {
                        OVERLAY_W - PANEL_MARGIN * 2, HINT_H),
                NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
     nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 1);
-    nk_label(pCtx, "Debug menu: press ` to toggle", NK_TEXT_LEFT);
+    nk_label(pCtx, "ROLLER menu: press ` to toggle", NK_TEXT_LEFT);
   }
   nk_end(pCtx);
 }
@@ -948,10 +930,18 @@ static void DrawHintPanel(DebugOverlay *pOverlay) {
 
 static void DrawDebugPanel(DebugOverlay *pOverlay) {
   struct nk_context *pCtx = &pOverlay->nk;
-  if (nk_begin(pCtx, "Settings",
-               nk_rect(PANEL_MARGIN, PANEL_Y, LEFT_W, PANEL_H),
+#if defined(IS_WASM)
+  int iGeneralW = PANEL_FULL_W;
+#else
+  int iGeneralW = PANEL_COLUMN_W;
+#endif
+  if (nk_begin(pCtx, "General",
+               nk_rect(PANEL_MARGIN, PANEL_Y, iGeneralW, PANEL_H),
                NK_WINDOW_BORDER | NK_WINDOW_TITLE)) {
-#ifdef __ANDROID__
+#if defined(IS_WASM)
+    static const char *apszMusic[] = { "MIDI (OPL3)", "CD" };
+    int iMusicSel = (MusicCD != 0) ? 1 : 0;
+#elif defined(IS_ANDROID)
     static const char *apszMusic[] = { "MIDI", "MIDI (OPL3)", "CD" };
     int iMusicSel = (MusicCD != 0) ? 2 : (MusicOPL != 0) ? 1 : 0;
 #else
@@ -1061,6 +1051,17 @@ static void DrawDebugPanel(DebugOverlay *pOverlay) {
 
 #if defined(IS_ANDROID)
     {
+      int bForceLandscape = (int)g_bForceLandscape;
+      nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 1);
+      if (nk_checkbox_label(pCtx, "Force landscape mode", &bForceLandscape)) {
+        InputSetForceLandscape((bool)bForceLandscape);
+        InputSaveConfig();
+      }
+    }
+#endif
+
+#if defined(IS_ANDROID) || defined(IS_WASM)
+    {
       static const char *apszPhoneControls[] = { "Disabled", "Tilt turn", "Touch turn" };
       int iSel = (int)g_ePhoneControls;
       if (iSel < 0 || iSel > 2)
@@ -1081,13 +1082,13 @@ static void DrawDebugPanel(DebugOverlay *pOverlay) {
       }
     }
 #endif
-
-    nk_layout_row_dynamic(pCtx, DEBUG_SPACING_H, 1);
-    nk_spacing(pCtx, 1);
-    nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 1);
-    nk_label(pCtx, "Experimental", NK_TEXT_LEFT);
+  }
+  nk_end(pCtx);
 
 #if !defined(IS_WASM)
+  if (nk_begin(pCtx, "Graphics",
+               nk_rect(GRAPHICS_PANEL_X, PANEL_Y, PANEL_COLUMN_W, PANEL_H),
+               NK_WINDOW_BORDER | NK_WINDOW_TITLE)) {
     {
       static const char *apszCRTFilterModes[] = { "Off", "VGA", "Hyllian" };
       nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 2);
@@ -1099,7 +1100,6 @@ static void DrawDebugPanel(DebugOverlay *pOverlay) {
         InputSaveConfig();
       }
     }
-#endif
 
     MenuRenderer *pRenderer = GetMenuRenderer();
     if (pRenderer) {
@@ -1487,11 +1487,6 @@ static void DrawDebugPanel(DebugOverlay *pOverlay) {
         InputSaveConfig();
       }
 
-      int bHideLog = pOverlay->bHideLog ? 1 : 0;
-      nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 1);
-      if (nk_checkbox_label(pCtx, "Hide log", &bHideLog))
-        pOverlay->bHideLog = bHideLog != 0;
-
       int bReset = 0;
       nk_layout_row_dynamic(pCtx, DEBUG_ROW_H, 1);
       if (nk_checkbox_label(pCtx, "Reset graphics", &bReset) && bReset) {
@@ -1535,29 +1530,7 @@ static void DrawDebugPanel(DebugOverlay *pOverlay) {
     }
   }
   nk_end(pCtx);
-}
-
-static void DrawLogPanel(DebugOverlay *pOverlay) {
-  struct nk_context *pCtx = &pOverlay->nk;
-
-  if (nk_begin(pCtx, "Log",
-               nk_rect(RIGHT_X, PANEL_Y, RIGHT_W, PANEL_H),
-               NK_WINDOW_BORDER | NK_WINDOW_TITLE | NK_WINDOW_NO_SCROLLBAR)) {
-    nk_layout_row_dynamic(pCtx, PANEL_H - 50, 1);
-    if (nk_group_begin(pCtx, "log_inner", NK_WINDOW_BORDER)) {
-      nk_layout_row_dynamic(pCtx, LOG_ROW_H, 1);
-      SDL_LockMutex(pOverlay->pLogMutex);
-      int iCount = pOverlay->iLogCount;
-      int iHead  = pOverlay->iLogHead;
-      for (int iI = 0; iI < iCount; iI++) {
-        int iIdx = (iHead + iI) % MAX_LOG_MESSAGES;
-        nk_label(pCtx, pOverlay->aLogEntries[iIdx].szText, NK_TEXT_LEFT);
-      }
-      SDL_UnlockMutex(pOverlay->pLogMutex);
-      nk_group_end(pCtx);
-    }
-  }
-  nk_end(pCtx);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,7 +1541,9 @@ void debug_overlay_render(DebugOverlay *pOverlay,
                           SDL_GPUCommandBuffer *pCmdBuf,
                           SDL_GPUTexture *pSwapchainTex,
                           Uint32 uiSwapchainW, Uint32 uiSwapchainH) {
+#if !defined(IS_WASM)
   SDL_GPUViewport viewport = {0};
+#endif
 
   const bool *_kb = SDL_GetKeyboardState(NULL);
   bool bShiftLabel = _kb[SDL_SCANCODE_LSHIFT] || _kb[SDL_SCANCODE_RSHIFT];
@@ -1595,10 +1570,16 @@ void debug_overlay_render(DebugOverlay *pOverlay,
   if (pOverlay->bVisible) {
     DrawHintPanel(pOverlay);
     DrawDebugPanel(pOverlay);
-    if (!pOverlay->bHideLog)
-      DrawLogPanel(pOverlay);
   }
 
+#if defined(IS_WASM)
+  (void)pCmdBuf;
+  (void)pSwapchainTex;
+  (void)nuklear_sdl_renderer_render(
+      pOverlay->pSDLRenderer, pCtx, OVERLAY_W, OVERLAY_H,
+      (int)uiSwapchainW, (int)uiSwapchainH);
+  return;
+#else
   /* Lazy re-rasterize: hash the Nuklear command buffer (FNV-1a).
    * Skip the expensive software raster + GPU upload when nothing changed;
    * the GPU texture still holds the previous frame's correct content.
@@ -1643,4 +1624,5 @@ void debug_overlay_render(DebugOverlay *pOverlay,
   SDL_BindGPUFragmentSamplers(pRp, 0, &binding, 1);
   SDL_DrawGPUPrimitives(pRp, 3, 1, 0, 0);
   SDL_EndGPURenderPass(pRp);
+#endif
 }

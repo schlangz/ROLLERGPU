@@ -38,8 +38,8 @@ char revs_files2[6][13] = //000A420E
   "pancar2.bm",
   ""
 };
-char texture_file[13] = "texture.drh";  //000A425C
-char bldtex_file[13] = "building.drh";  //000A4269
+char texture_file[ROLLER_MAX_PATH] = "texture.drh";  //000A425C
+char bldtex_file[ROLLER_MAX_PATH] = "building.drh";  //000A4269
 char gencartex_name[11] = "gentex.drh"; //000A4276
 int car_remap[4096];    //001446C0
 int cargen_remap[256];  //001486C0
@@ -322,6 +322,7 @@ void LoadPanel()
         ErrorBoxExit("Unable to open %s", szRevFile);
         //printf("Unable to open %s\n\n", szRevFile);
         //doexit();
+        return;
       }
       close(iFileHandle);
 
@@ -345,6 +346,7 @@ void LoadPanel()
         ErrorBoxExit("Unable to open %s", szRevFile);
         //printf("Unable to open %s\n\n", szRevFile);
         //doexit();
+        return;
       }
       close(iFileHandle);
 
@@ -390,7 +392,7 @@ void InitRemaps()
 
 //-------------------------------------------------------------------------------------------------
 //000285B0
-void LoadGenericCarTextures()
+void LoadGenericCarTexturesFromFile(const char *szTextureFile)
 {
   int iFileHandle; // edx
   signed int iFileLength; // ecx
@@ -400,19 +402,30 @@ void LoadGenericCarTextures()
   int iMapSelMode; // ebx
   uint8 *pFileBuf; // [esp+0h] [ebp-14h] BYREF
 
+  if (!szTextureFile || !szTextureFile[0]) {
+    ErrorBoxExit("Generic texture map path is empty");
+    return;
+  }
+
   // Check if generic car texture file exists
-  iFileHandle = ROLLERopen(gencartex_name, O_RDONLY | O_BINARY); //0x200 is O_BINARY in WATCOM/h/fcntl.h
+  iFileHandle = ROLLERopen(szTextureFile, O_RDONLY | O_BINARY); //0x200 is O_BINARY in WATCOM/h/fcntl.h
   if (iFileHandle == -1) {
-    ErrorBoxExit("Unable to open texture map data file <%s>", gencartex_name);
+    ErrorBoxExit("Unable to open texture map data file <%s>", szTextureFile);
     //printf("Unable to open texture map data file <%s>\n\n", gencartex_name);
     //doexit();
+    return;
   }
   close(iFileHandle);
 
   // Get compressed file size and calculate number of texture blocks
-  iFileLength = getcompactedfilelength(gencartex_name);
+  iFileLength = getcompactedfilelength(szTextureFile);
   iNumTextures = iFileLength / 4096;
   iNumTextures_1 = iNumTextures;
+
+  /* The game loads this bank once. The editor may initialize another facade
+   * lifecycle in the same process, so release the previous CPU atlas before
+   * replacing it. Renderer-side slot replacement is already bounded. */
+  fre((void **)&cargen_vga);
 
   if (gfx_size == 1) {
     // Allocate buffer for processd textures (aligned to 8-tex boundaries)
@@ -423,7 +436,7 @@ void LoadGenericCarTextures()
     pFileBuf = (uint8 *)getbuffer(iFileLength);
 
     // Load tex data
-    loadcompactedfile(gencartex_name, pFileBuf);
+    loadcompactedfile(szTextureFile, pFileBuf);
 
     // Recalculate tex count
     iFinalTexCount = iFileLength / 4096;
@@ -445,7 +458,7 @@ void LoadGenericCarTextures()
     iFinalTexCount = iFileLength / 4096;
 
     // Load tex data
-    loadcompactedfile(gencartex_name, cargen_vga);
+    loadcompactedfile(szTextureFile, cargen_vga);
 
     // setmapsel mode
     iMapSelMode = 0;
@@ -464,6 +477,13 @@ void LoadGenericCarTextures()
 
   // Update count
   num_textures[18] = iNumTextures_1;
+}
+
+//-------------------------------------------------------------------------------------------------
+
+void LoadGenericCarTextures()
+{
+  LoadGenericCarTexturesFromFile(gencartex_name);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -523,6 +543,7 @@ void LoadCarTexture(int iCartexIdx, uint8 byTexSlotIdx)
     ErrorBoxExit("Unable to open texture map data file <%s>", szTexFile);
     //printf("Unable to open texture map data file <%s>\n\n", szTexFile);
     //doexit();
+    return;
   }
   close(iFileHandle);
 
@@ -705,6 +726,7 @@ void LoadBldTextures()
     ErrorBoxExit("Unable to open bld texture map data file");
     //printf("Unable to open bld texture map data file\n\n");
     //doexit();
+    return;
   }
   close(iFileHandle);
 
@@ -789,6 +811,7 @@ void LoadTextures()
     ErrorBoxExit("Unable to open texture map data file");
     //printf("Unable to open texture map data file\n\n");
     //doexit();
+    return;
   }
   close(iFileHandle);
 

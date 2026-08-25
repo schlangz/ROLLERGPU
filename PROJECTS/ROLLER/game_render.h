@@ -52,6 +52,10 @@ GameRenderer *game_render_create(SDL_GPUDevice *device, SDL_Window *window);
 void game_render_destroy(GameRenderer *renderer);
 void game_render_set_mode(GameRenderer *renderer, GameRenderMode mode);
 GameRenderMode game_render_get_mode(const GameRenderer *renderer);
+/* Adds a GPU backend to an existing software renderer without disturbing it
+ * unless all backend creation and retained-texture uploads succeed. */
+bool game_render_attach_gpu_device(GameRenderer *renderer,
+                                   SDL_GPUDevice *device);
 void game_render_set_force_gpu_load(GameRenderer *renderer, bool force);
 void game_render_set_particle_depth(GameRenderer *renderer, float ndcZ);
 void game_render_set_particle_depth_pervertex(GameRenderer *renderer, const float ndcZ[4]);
@@ -63,6 +67,20 @@ void game_render_set_crt_filter(GameRenderer *renderer, CRTFilter *filter);
 // Frame lifecycle
 void game_render_begin_frame(GameRenderer *renderer);
 void game_render_end_frame(GameRenderer *renderer);
+/* Editor-only synchronous software completion. Converts the native indexed
+ * frame directly to top-left RGBA8 and scales with opaque-black letterboxing;
+ * it never calls UpdateSDLWindow or simulates a GPU download. */
+bool game_render_end_frame_software_readback(
+    GameRenderer *renderer,
+    const uint8 *pbyIndexedPixels,
+    uint32_t uiIndexedRowPitch,
+    uint32_t uiNativeWidth,
+    uint32_t uiNativeHeight,
+    uint8 *pbyRGBA,
+    uint32_t uiRGBABufferSize,
+    uint32_t uiRGBARowPitch,
+    uint32_t uiRGBAWidth,
+    uint32_t uiRGBAHeight);
 
 // Mirror pass (rearview / side view): in GPU mode, the scene calls made
 // between begin/end (with a secondary camera already set via
@@ -189,6 +207,10 @@ void game_render_draw_pause_darken(GameRenderer *renderer);
 // Viewport
 void game_render_set_viewport(GameRenderer *renderer,
                               int x, int y, int w, int h);
+/* Decouples physical viewport resolution from the legacy logical projection.
+ * Zero restores ordinary game behavior. */
+void game_render_set_projection_reference_height(GameRenderer *renderer,
+                                                  int height);
 void game_render_set_target(GameRenderer *renderer, uint8 *buffer,
                             int stride, int width, int height);
 
@@ -215,6 +237,12 @@ void game_render_free_texture(GameRenderer *renderer,
 // Look up the GameRenderer-level handle registered for a texture bank index.
 TextureHandle game_render_get_texture_handle(GameRenderer *renderer,
                                              int tex_idx);
+
+// E1-S9. Live renderer-owned texture resources, for a reload soak that has to
+// tell "the loader replaced the previous track's textures" from "the loader
+// leaked them". Every field counts entries in a bounded table.
+void game_render_get_texture_counts(const GameRenderer *renderer,
+                                    SceneRenderTextureCounts *counts);
 
 // Asset loading — sprite blocks (HUD)
 TextureHandle game_render_load_blocks(GameRenderer *renderer, int slot,

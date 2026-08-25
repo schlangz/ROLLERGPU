@@ -4,9 +4,17 @@
 // setup extend this gate in E4 and E5 without changing the generated loader.
 var Module = (() => {
   const canvas = document.getElementById("canvas");
+  const gameFrame = document.querySelector(".game-frame");
   const startGate = document.getElementById("start-gate");
   const gateTitle = document.getElementById("gate-title");
   const status = document.getElementById("status");
+  const phoneStatus = document.getElementById("phone-status");
+  const fullscreenButton = document.getElementById("fullscreen-button");
+  const textDialog = document.getElementById("text-dialog");
+  const textDialogTitle = document.getElementById("text-dialog-title");
+  const textDialogInput = document.getElementById("text-dialog-input");
+  const textDialogHelp = document.getElementById("text-dialog-help");
+  const textDialogCancel = document.getElementById("text-dialog-cancel");
   const progress = document.getElementById("loading-progress");
   const gateActions = document.getElementById("gate-actions");
   const playButton = document.getElementById("play-button");
@@ -29,14 +37,46 @@ var Module = (() => {
   const persistentDemoConfigPaths = ["/persist/FATAL.INI", "/persist/ROLLER.INI"];
   const importChunkBytes = 8 * 1024 * 1024;
   const importSizeWarningBytes = 800 * 1024 * 1024;
+  const phoneControlsTiltTurn = 1;
+  const phoneControlsTouchTurn = 2;
+  const motionFeatureNames = ["accelerometer", "gyroscope"];
+  const textDialogTargetName = 1;
+  const textDialogTargetReplay = 2;
+  const motionSampleIntervalMs = 1000 / 60;
+  const motionSampleTimeoutMs = 2000;
+  const motionDebug = new URLSearchParams(window.location.search).get("motiondebug") === "1";
+  const appleMobileMotion = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const motionAccelerationSign = appleMobileMotion ? -1 : 1;
   const extractionFailureMessage =
     "No game data could be extracted from the files you selected.\n\n" +
     "For a CUE/BIN image you must select the .CUE file AND all of its " +
     ".BIN/audio files together - selecting only the .CUE or only the .BIN " +
     "will not work, because the other files cannot be read on their own.\n\n" +
     "Please try again and select the .CUE and every file it references.";
+  const phoneModeDecision = detectPhoneMode();
   let runtimeReady = false;
   let runtimeStarted = false;
+  let activeTextDialogTarget = 0;
+  let phoneModeApplied = false;
+  let motionPermissionState = "not-requested";
+  let motionListening = false;
+  let motionSampleReceived = false;
+  let motionLastSampleMs = Number.NEGATIVE_INFINITY;
+  let motionSampleTimer = 0;
+  let phoneStatusTimer = 0;
+  let motionStatusMessage = "";
+  let motionDebugPaintTimer = 0;
+  let motionDebugLastPaintMs = Number.NEGATIVE_INFINITY;
+  let motionSensorPermissions = {
+    accelerometer: "unknown",
+    gyroscope: "unknown"
+  };
+  let viewportUpdateFrame = 0;
+  let viewportResizeNeedsSDL = false;
+  let syntheticWindowResize = false;
+  let visualViewportState = null;
+  let orientationLockRequest = 0;
   let gateBusy = true;
   let retailFatdataReady = false;
   let pendingImportFiles = null;
@@ -49,8 +89,724 @@ var Module = (() => {
     "/demo/fatdata/WHIPTIT.BM"
   ];
 
+  function detectPhoneMode() {
+    const override = new URLSearchParams(window.location.search).get("phone");
+    if (override === "0" || override === "1") {
+      return {
+        active: override === "1",
+        source: "query",
+        touchPoints: Number(navigator.maxTouchPoints) || 0,
+        coarsePointer: window.matchMedia("(pointer: coarse)").matches
+      };
+    }
+
+    const touchPoints = Number(navigator.maxTouchPoints) || 0;
+    const coarsePointer = window.matchMedia("(pointer: coarse)").matches;
+    return {
+      active: touchPoints > 0 && coarsePointer,
+      source: "capability",
+      touchPoints,
+      coarsePointer
+    };
+  }
+
+  document.documentElement.dataset.rollerPhoneMode = String(phoneModeDecision.active);
+
+  function applyPhoneMode() {
+    if (phoneModeApplied) {
+      return;
+    }
+    if (typeof Module["_ROLLERWebSetPhoneMode"] !== "function") {
+      throw new Error("This browser bundle does not contain phone-mode support.");
+    }
+
+    Module["_ROLLERWebSetPhoneMode"](phoneModeDecision.active ? 1 : 0);
+    Module["rollerPhoneMode"] = phoneModeDecision.active;
+    Module["rollerPhoneModeSource"] = phoneModeDecision.source;
+    Module["rollerPhoneTouchPoints"] = phoneModeDecision.touchPoints;
+    Module["rollerPhoneCoarsePointer"] = phoneModeDecision.coarsePointer;
+    phoneModeApplied = true;
+    console.log(
+      `ROLLER: phone mode ${phoneModeDecision.active ? "enabled" : "disabled"} ` +
+      `(${phoneModeDecision.source}, touch points ${phoneModeDecision.touchPoints}, ` +
+      `coarse pointer ${phoneModeDecision.coarsePointer ? "yes" : "no"})`
+    );
+  }
+
+  function readMotionPolicy() {
+    const policy = document.permissionsPolicy ?? document.featurePolicy;
+    const result = {};
+
+    for (const name of motionFeatureNames) {
+      if (typeof policy?.allowsFeature !== "function") {
+        result[name] = "unknown";
+        continue;
+      }
+      try {
+        result[name] = policy.allowsFeature(name) ? "allowed" : "blocked";
+      } catch (error) {
+        result[name] = "unknown";
+      }
+    }
+    return result;
+  }
+
+  function paintMotionDebugStatus() {
+    motionDebugPaintTimer = 0;
+    motionDebugLastPaintMs = performance.now();
+    if (!motionDebug)
+      return;
+
+    const policy = readMotionPolicy();
+    const accel = Array.isArray(Module["rollerMotionLastAccel"])
+      ? Module["rollerMotionLastAccel"].map((value) => Number(value).toFixed(2)).join(", ")
+      : "none";
+    const controls = runtimeReady ? phoneControlsScheme() : "not-ready";
+    phoneStatus.textContent = [
+      "MOTION DEBUG",
+      `secure=${window.isSecureContext} frame=${window.top === window.self ? "top" : "embedded"}`,
+      `phone=${phoneModeDecision.active} controls=${controls} ` +
+        `steering=${runtimeReady ? phoneSteeringValue() : "not-ready"}`,
+      `normalization=${appleMobileMotion ? "webkit-gravity-flip" : "standard"}`,
+      `permission=${motionPermissionState} listening=${motionListening}`,
+      `policy accel=${policy.accelerometer} gyro=${policy.gyroscope}`,
+      `browser accel=${motionSensorPermissions.accelerometer} gyro=${motionSensorPermissions.gyroscope}`,
+      `sample=${motionSampleReceived} xyz=${accel}`,
+      motionStatusMessage
+    ].filter(Boolean).join("\n");
+    phoneStatus.hidden = false;
+  }
+
+  function scheduleMotionDebugStatus() {
+    if (!motionDebug || motionDebugPaintTimer)
+      return;
+
+    const elapsed = performance.now() - motionDebugLastPaintMs;
+    if (elapsed >= 250) {
+      paintMotionDebugStatus();
+      return;
+    }
+    motionDebugPaintTimer = setTimeout(paintMotionDebugStatus, 250 - elapsed);
+  }
+
+  function updateMotionDiagnostics() {
+    const policy = readMotionPolicy();
+    Module["rollerMotionPermission"] = motionPermissionState;
+    Module["rollerMotionListening"] = motionListening;
+    Module["rollerMotionSampleReceived"] = motionSampleReceived;
+    Module["rollerMotionSecureContext"] = window.isSecureContext;
+    Module["rollerMotionPolicy"] = policy;
+    Module["rollerMotionSensorPermissions"] = { ...motionSensorPermissions };
+    Module["rollerMotionAccelerationSign"] = motionAccelerationSign;
+    scheduleMotionDebugStatus();
+  }
+
+  function showPhoneStatus(message) {
+    motionStatusMessage = message;
+    if (motionDebug) {
+      if (phoneStatusTimer) {
+        clearTimeout(phoneStatusTimer);
+        phoneStatusTimer = 0;
+      }
+      paintMotionDebugStatus();
+      return;
+    }
+    if (phoneStatusTimer) {
+      clearTimeout(phoneStatusTimer);
+      phoneStatusTimer = 0;
+    }
+    phoneStatus.textContent = message;
+    phoneStatus.hidden = false;
+    if (!runtimeStarted)
+      status.textContent = message;
+    phoneStatusTimer = setTimeout(() => {
+      phoneStatus.hidden = true;
+      phoneStatusTimer = 0;
+    }, 5000);
+  }
+
+  function phoneControlsScheme() {
+    if (typeof Module["_ROLLERWebGetPhoneControls"] !== "function")
+      return phoneControlsTiltTurn;
+    return Module["_ROLLERWebGetPhoneControls"]();
+  }
+
+  function phoneSteeringValue() {
+    if (typeof Module["_ROLLERWebGetPhoneSteering"] !== "function")
+      return "unavailable";
+    return Module["_ROLLERWebGetPhoneSteering"]();
+  }
+
+  function clearMotionSampleTimer() {
+    if (motionSampleTimer) {
+      clearTimeout(motionSampleTimer);
+      motionSampleTimer = 0;
+    }
+  }
+
+  function setWebAccel(fX, fY, fZ) {
+    if (typeof Module["_ROLLERWebSetAccel"] === "function")
+      Module["_ROLLERWebSetAccel"](fX, fY, fZ);
+  }
+
+  function handleDeviceMotion(event) {
+    if (!motionListening || document.hidden)
+      return;
+
+    const accel = event.accelerationIncludingGravity;
+    const fX = Number(accel?.x) * motionAccelerationSign;
+    const fY = Number(accel?.y) * motionAccelerationSign;
+    const fZ = Number(accel?.z) * motionAccelerationSign;
+    if (!Number.isFinite(fX) || !Number.isFinite(fY) || !Number.isFinite(fZ))
+      return;
+
+    const now = performance.now();
+    if (now - motionLastSampleMs < motionSampleIntervalMs)
+      return;
+    motionLastSampleMs = now;
+
+    // WebKit builds accelerationIncludingGravity from Core Motion's gravity
+    // vector, whose sign is opposite the W3C/Android proper-acceleration
+    // convention. Normalize Apple mobile browsers before the shared C path
+    // applies the portrait or landscape orientation sign/swap.
+    setWebAccel(fX, fY, fZ);
+    motionSampleReceived = true;
+    Module["rollerMotionLastAccel"] = [fX, fY, fZ];
+    clearMotionSampleTimer();
+    updateMotionDiagnostics();
+  }
+
+  function stopPhoneMotionSubscription() {
+    if (motionListening) {
+      window.removeEventListener("devicemotion", handleDeviceMotion);
+      motionListening = false;
+    }
+    clearMotionSampleTimer();
+    motionSampleReceived = false;
+    motionLastSampleMs = Number.NEGATIVE_INFINITY;
+    if (phoneModeDecision.active)
+      setWebAccel(0.0, 0.0, 0.0);
+    updateMotionDiagnostics();
+  }
+
+  function useTouchSteeringFallback(message, state) {
+    stopPhoneMotionSubscription();
+    motionPermissionState = state;
+    if (typeof Module["_ROLLERWebSetPhoneControls"] === "function")
+      Module["_ROLLERWebSetPhoneControls"](phoneControlsTouchTurn);
+    Module["rollerMotionFallback"] = true;
+    showPhoneStatus(message);
+    updateMotionDiagnostics();
+  }
+
+  function scheduleMotionSampleTimeout() {
+    clearMotionSampleTimer();
+    if (!motionListening || motionSampleReceived)
+      return;
+
+    motionSampleTimer = setTimeout(() => {
+      motionSampleTimer = 0;
+      if (document.hidden || phoneControlsScheme() !== phoneControlsTiltTurn)
+        return;
+      useTouchSteeringFallback(
+        "Motion data is unavailable; using touch steering.",
+        "unavailable"
+      );
+    }, motionSampleTimeoutMs);
+  }
+
+  function startPhoneMotionSubscription() {
+    if (!phoneModeDecision.active || motionPermissionState !== "granted" ||
+        document.hidden || phoneControlsScheme() !== phoneControlsTiltTurn) {
+      return;
+    }
+    if (!motionListening) {
+      window.addEventListener("devicemotion", handleDeviceMotion, { passive: true });
+      motionListening = true;
+      motionSampleReceived = false;
+      motionLastSampleMs = Number.NEGATIVE_INFINITY;
+      scheduleMotionSampleTimeout();
+    } else if (!motionSampleReceived) {
+      scheduleMotionSampleTimeout();
+    }
+    updateMotionDiagnostics();
+  }
+
+  function refreshPhoneMotionSubscription() {
+    if (motionPermissionState === "granted" &&
+        phoneControlsScheme() === phoneControlsTiltTurn) {
+      startPhoneMotionSubscription();
+    } else {
+      stopPhoneMotionSubscription();
+    }
+  }
+
+  async function readBrowserMotionPermissions() {
+    if (typeof navigator.permissions?.query !== "function")
+      return;
+
+    const permissions = {};
+    for (const name of motionFeatureNames) {
+      try {
+        const status = await navigator.permissions.query({ name });
+        permissions[name] = status.state;
+      } catch (error) {
+        permissions[name] = "unsupported";
+      }
+    }
+    motionSensorPermissions = permissions;
+    updateMotionDiagnostics();
+  }
+
+  async function requestPhoneMotionFromGesture() {
+    if (!phoneModeDecision.active) {
+      motionPermissionState = "not-applicable";
+      updateMotionDiagnostics();
+      return;
+    }
+    if (phoneControlsScheme() !== phoneControlsTiltTurn) {
+      updateMotionDiagnostics();
+      return;
+    }
+    if (!window.isSecureContext) {
+      useTouchSteeringFallback(
+        "Tilt requires HTTPS; using touch steering.",
+        "insecure-context"
+      );
+      return;
+    }
+    if (!("DeviceMotionEvent" in window)) {
+      useTouchSteeringFallback(
+        "Motion controls are unavailable; using touch steering.",
+        "unavailable"
+      );
+      return;
+    }
+
+    const policy = readMotionPolicy();
+    if (motionFeatureNames.some((name) => policy[name] === "blocked")) {
+      useTouchSteeringFallback(
+        "Motion sensors are blocked by this page or frame; using touch steering.",
+        "policy-blocked"
+      );
+      return;
+    }
+
+    const requestPermission = window.DeviceMotionEvent?.requestPermission;
+    if (typeof requestPermission === "function") {
+      motionPermissionState = "requesting";
+      status.textContent = "Requesting tilt steering permission...";
+      updateMotionDiagnostics();
+      try {
+        const result = await requestPermission.call(window.DeviceMotionEvent);
+        if (result !== "granted") {
+          useTouchSteeringFallback(
+            "Tilt permission was denied; using touch steering.",
+            "denied"
+          );
+          return;
+        }
+      } catch (error) {
+        console.warn("ROLLER: motion permission request failed", error);
+        useTouchSteeringFallback(
+          "Tilt permission could not be granted; using touch steering.",
+          "error"
+        );
+        return;
+      }
+      motionSensorPermissions = {
+        accelerometer: "explicitly-granted",
+        gyroscope: "explicitly-granted"
+      };
+    } else {
+      await readBrowserMotionPermissions();
+      if (motionFeatureNames.some((name) => motionSensorPermissions[name] === "denied")) {
+        useTouchSteeringFallback(
+          "Motion sensors are blocked in browser site settings; using touch steering.",
+          "site-settings-blocked"
+        );
+        return;
+      }
+    }
+
+    motionPermissionState = "granted";
+    Module["rollerMotionFallback"] = false;
+    updateMotionDiagnostics();
+    startPhoneMotionSubscription();
+  }
+
+  function sanitizeTextDialogValue(value, target) {
+    const allowSpaces = target === textDialogTargetName;
+    let sanitized = "";
+
+    for (const original of String(value ?? "")) {
+      let ch = original;
+      if (ch >= "a" && ch <= "z")
+        ch = ch.toUpperCase();
+      if ((ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") ||
+          (allowSpaces && ch === " ")) {
+        sanitized += ch;
+        if (sanitized.length === 8)
+          break;
+      }
+    }
+
+    return sanitized;
+  }
+
+  function filterTextDialogInput() {
+    if (!activeTextDialogTarget)
+      return;
+
+    const value = textDialogInput.value;
+    const selection = textDialogInput.selectionStart ?? value.length;
+    const sanitized = sanitizeTextDialogValue(value, activeTextDialogTarget);
+    if (sanitized === value)
+      return;
+
+    const filteredSelection = sanitizeTextDialogValue(
+      value.slice(0, selection), activeTextDialogTarget
+    ).length;
+    textDialogInput.value = sanitized;
+    textDialogInput.setSelectionRange(filteredSelection, filteredSelection);
+  }
+
+  function showTextDialog(target, currentValue) {
+    if (!phoneModeDecision.active || !runtimeStarted || activeTextDialogTarget ||
+        (target !== textDialogTargetName && target !== textDialogTargetReplay)) {
+      return false;
+    }
+
+    activeTextDialogTarget = target;
+    textDialogTitle.textContent = target === textDialogTargetName
+      ? "ENTER NAME"
+      : "SAVE REPLAY";
+    textDialogHelp.textContent = target === textDialogTargetName
+      ? "Letters, digits, and spaces; 8 characters maximum"
+      : "Letters and digits; 8 characters maximum";
+    textDialogInput.value = sanitizeTextDialogValue(currentValue, target);
+    textDialog.hidden = false;
+    Module["rollerTextDialogActive"] = true;
+    Module["rollerTextDialogTarget"] = target;
+    updateFullscreenUI();
+
+    const virtualKeyboard = navigator.virtualKeyboard;
+    if (virtualKeyboard && typeof virtualKeyboard.show === "function")
+      textDialogInput.virtualKeyboardPolicy = "manual";
+    try {
+      textDialogInput.focus({ preventScroll: true });
+    } catch (error) {
+      textDialogInput.focus();
+    }
+    const end = textDialogInput.value.length;
+    textDialogInput.setSelectionRange(end, end);
+    virtualKeyboard?.show?.();
+    return true;
+  }
+
+  function completeTextDialog(accepted) {
+    if (!activeTextDialogTarget)
+      return;
+
+    const target = activeTextDialogTarget;
+    const value = accepted
+      ? sanitizeTextDialogValue(textDialogInput.value, target)
+      : "";
+    activeTextDialogTarget = 0;
+    textDialog.hidden = true;
+    navigator.virtualKeyboard?.hide?.();
+    textDialogInput.blur();
+    Module["rollerTextDialogActive"] = false;
+    Module["rollerTextDialogTarget"] = 0;
+
+    Module.ccall(
+      "ROLLERWebTextDialogComplete",
+      null,
+      ["number", "string", "number"],
+      [target, value, accepted ? 1 : 0]
+    );
+    updateFullscreenUI();
+    // Wait until the input's Done/Enter event has fully unwound so its keyup
+    // cannot be delivered to SDL after focus returns to the canvas.
+    requestAnimationFrame(focusCanvas);
+  }
+
+  function moduleDiagnosticsAvailable() {
+    return typeof Module === "object" && Module !== null;
+  }
+
+  function readVisualViewport() {
+    const viewport = window.visualViewport;
+    const fallbackWidth = window.innerWidth || document.documentElement.clientWidth;
+    const fallbackHeight = window.innerHeight || document.documentElement.clientHeight;
+
+    return {
+      width: Math.max(1, Number(viewport?.width) || fallbackWidth || 1),
+      height: Math.max(1, Number(viewport?.height) || fallbackHeight || 1),
+      offsetLeft: Number(viewport?.offsetLeft) || 0,
+      offsetTop: Number(viewport?.offsetTop) || 0,
+      scale: Number(viewport?.scale) || 1,
+      source: viewport ? "visualViewport" : "window"
+    };
+  }
+
+  function cssPixels(value) {
+    return `${Math.round(value * 100) / 100}px`;
+  }
+
+  function applyVisualViewportLayout(notifySDL) {
+    visualViewportState = readVisualViewport();
+    const rootStyle = document.documentElement.style;
+    rootStyle.setProperty("--roller-viewport-width", cssPixels(visualViewportState.width));
+    rootStyle.setProperty("--roller-viewport-height", cssPixels(visualViewportState.height));
+    rootStyle.setProperty(
+      "--roller-landscape-width",
+      cssPixels(visualViewportState.height * 1.6)
+    );
+
+    if (moduleDiagnosticsAvailable())
+      Module["rollerVisualViewport"] = { ...visualViewportState };
+
+    // SDL's Emscripten video driver listens to window resize, reads the CSS
+    // canvas size, and then updates the backing canvas and SDL window. Mobile
+    // browser chrome can resize visualViewport without resizing window, so
+    // bridge that event after the CSS dimensions have been committed.
+    if (notifySDL)
+      notifySDLWindowResize();
+  }
+
+  function notifySDLWindowResize() {
+    if (!runtimeStarted)
+      return;
+
+    const width = Math.round(canvas.clientWidth);
+    const height = Math.round(canvas.clientHeight);
+    if (width <= 0 || height <= 0)
+      return;
+
+    if (typeof Module["_ROLLERWebSetWindowSize"] === "function") {
+      Module["_ROLLERWebSetWindowSize"](width, height);
+      return;
+    }
+
+    // Compatibility fallback for a stale loader paired with this shell.
+    syntheticWindowResize = true;
+    try {
+      window.dispatchEvent(new Event("resize"));
+    } finally {
+      syntheticWindowResize = false;
+    }
+  }
+
+  function scheduleVisualViewportLayout(notifySDL = false) {
+    viewportResizeNeedsSDL ||= notifySDL;
+    if (viewportUpdateFrame)
+      return;
+
+    viewportUpdateFrame = requestAnimationFrame(() => {
+      viewportUpdateFrame = 0;
+      const shouldNotifySDL = viewportResizeNeedsSDL;
+      viewportResizeNeedsSDL = false;
+      applyVisualViewportLayout(shouldNotifySDL);
+    });
+  }
+
+  function activeFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function unlockScreenOrientation() {
+    const orientation = window.screen?.orientation;
+    if (typeof orientation?.unlock !== "function")
+      return;
+
+    try {
+      orientation.unlock();
+    } catch (error) {
+      console.warn("ROLLER: screen orientation unlock failed", error);
+    }
+  }
+
+  async function syncFullscreenOrientation() {
+    const request = ++orientationLockRequest;
+    const active = activeFullscreenElement() === gameFrame;
+    const orientation = window.screen?.orientation;
+    const supported = typeof orientation?.lock === "function";
+
+    Module["rollerOrientationLockSupported"] = supported;
+    if (!active) {
+      unlockScreenOrientation();
+      Module["rollerOrientationLockActive"] = false;
+      return;
+    }
+
+    if (!supported) {
+      Module["rollerOrientationLockActive"] = false;
+      return;
+    }
+
+    try {
+      await orientation.lock("landscape");
+      if (request !== orientationLockRequest ||
+          activeFullscreenElement() !== gameFrame) {
+        unlockScreenOrientation();
+        Module["rollerOrientationLockActive"] = false;
+        return;
+      }
+      Module["rollerOrientationLockActive"] = true;
+    } catch (error) {
+      if (request === orientationLockRequest) {
+        Module["rollerOrientationLockActive"] = false;
+        console.warn("ROLLER: landscape orientation lock failed", error);
+      }
+    }
+  }
+
+  function fullscreenRequestMethod() {
+    return gameFrame.requestFullscreen || gameFrame.webkitRequestFullscreen;
+  }
+
+  function fullscreenTargetSize() {
+    const viewport = readVisualViewport();
+    let screenWidth = Number(window.screen?.width) || viewport.width;
+    let screenHeight = Number(window.screen?.height) || viewport.height;
+    const viewportIsLandscape = viewport.width >= viewport.height;
+    const screenIsLandscape = screenWidth >= screenHeight;
+
+    // Some mobile engines retain natural-orientation screen dimensions until
+    // after fullscreen. Align them with the current viewport before sizing.
+    if (viewportIsLandscape !== screenIsLandscape)
+      [screenWidth, screenHeight] = [screenHeight, screenWidth];
+
+    return {
+      width: Math.max(viewport.width, screenWidth),
+      height: Math.max(viewport.height, screenHeight)
+    };
+  }
+
+  function prepareFullscreenSizing() {
+    const target = fullscreenTargetSize();
+    gameFrame.style.setProperty("--roller-fullscreen-width", cssPixels(target.width));
+    gameFrame.style.setProperty("--roller-fullscreen-height", cssPixels(target.height));
+    gameFrame.classList.add("fullscreen-sizing");
+
+    // A wrapper-originated fullscreenchange makes SDL mark its window as
+    // fullscreen, after which its Emscripten resize handler ignores window
+    // resize events. Size the CSS canvas and notify SDL synchronously before
+    // requestFullscreen(), while the driver still accepts the new dimensions.
+    gameFrame.getBoundingClientRect();
+    notifySDLWindowResize();
+    if (moduleDiagnosticsAvailable())
+      Module["rollerFullscreenTarget"] = { ...target };
+  }
+
+  function clearFullscreenSizing() {
+    gameFrame.classList.remove("fullscreen-sizing");
+    gameFrame.style.removeProperty("--roller-fullscreen-width");
+    gameFrame.style.removeProperty("--roller-fullscreen-height");
+  }
+
+  function syncFullscreenLayoutToSDL() {
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    if (width <= 0 || height <= 0)
+      return;
+
+    // Use the canvas content box, not the raw screen or wrapper box: fullscreen
+    // safe-area padding can make both larger than the actual touch surface.
+    notifySDLWindowResize();
+    if (moduleDiagnosticsAvailable()) {
+      const frameRect = gameFrame.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+      const frameStyle = getComputedStyle(gameFrame);
+      Module["rollerFullscreenTarget"] = { width, height };
+      Module["rollerFullscreenLayout"] = {
+        frame: {
+          x: frameRect.x,
+          y: frameRect.y,
+          width: frameRect.width,
+          height: frameRect.height
+        },
+        canvas: {
+          x: canvasRect.x,
+          y: canvasRect.y,
+          width: canvasRect.width,
+          height: canvasRect.height,
+          backingWidth: canvas.width,
+          backingHeight: canvas.height
+        },
+        padding: {
+          top: parseFloat(frameStyle.paddingTop) || 0,
+          right: parseFloat(frameStyle.paddingRight) || 0,
+          bottom: parseFloat(frameStyle.paddingBottom) || 0,
+          left: parseFloat(frameStyle.paddingLeft) || 0
+        }
+      };
+    }
+  }
+
+  function fullscreenSupported() {
+    const enabled = document.fullscreenEnabled ?? document.webkitFullscreenEnabled;
+    return enabled !== false &&
+           typeof fullscreenRequestMethod() === "function";
+  }
+
+  function updateFullscreenUI() {
+    const supported = fullscreenSupported();
+    const active = activeFullscreenElement() === gameFrame;
+    fullscreenButton.hidden = !phoneModeDecision.active || !runtimeStarted ||
+                              !supported || active || !!activeTextDialogTarget;
+    fullscreenButton.textContent = "FULLSCREEN";
+    fullscreenButton.setAttribute("aria-label", "Enter fullscreen");
+    if (active)
+      fullscreenButton.blur();
+
+    if (moduleDiagnosticsAvailable()) {
+      Module["rollerFullscreenSupported"] = supported;
+      Module["rollerFullscreenActive"] = active;
+    }
+  }
+
+  async function toggleFullscreenFromGesture() {
+    if (!fullscreenSupported()) {
+      showPhoneStatus("Fullscreen is unavailable in this browser.");
+      return;
+    }
+
+    try {
+      if (activeFullscreenElement())
+        return;
+      prepareFullscreenSizing();
+      const operation = fullscreenRequestMethod().call(gameFrame);
+      await operation;
+    } catch (error) {
+      clearFullscreenSizing();
+      notifySDLWindowResize();
+      console.warn("ROLLER: fullscreen request failed", error);
+      showPhoneStatus("Fullscreen could not be opened; continuing in the browser.");
+      updateFullscreenUI();
+    }
+  }
+
+  function handleFullscreenChange() {
+    const active = activeFullscreenElement() === gameFrame;
+    void syncFullscreenOrientation();
+    if (active)
+      syncFullscreenLayoutToSDL();
+    updateFullscreenUI();
+    if (active) {
+      showPhoneStatus("Use Back or the browser fullscreen gesture to exit.");
+    } else {
+      clearFullscreenSizing();
+      scheduleVisualViewportLayout(true);
+    }
+    if (runtimeStarted)
+      focusCanvas();
+  }
+
   function focusCanvas() {
-    if (document.visibilityState === "visible" && document.activeElement !== canvas) {
+    if (!activeTextDialogTarget && document.visibilityState === "visible" &&
+        document.activeElement !== canvas) {
       canvas.focus({ preventScroll: true });
     }
   }
@@ -87,18 +843,24 @@ var Module = (() => {
     cancelImportButton.disabled = busy || !runtimeReady;
   }
 
-  function startRuntime() {
+  async function startRuntime() {
     if (!runtimeReady || runtimeStarted || gateBusy) {
       return;
     }
 
     setGateBusy(true);
-    runtimeStarted = true;
-    startGate.hidden = true;
-    focusCanvas();
     try {
+      applyPhoneMode();
+      await requestPhoneMotionFromGesture();
+      runtimeStarted = true;
+      startGate.hidden = true;
+      updateFullscreenUI();
+      focusCanvas();
+      setTimeout(refreshPhoneMotionSubscription, 0);
       Module.callMain(["--no-crash-handler"]);
+      scheduleVisualViewportLayout(true);
     } catch (error) {
+      stopPhoneMotionSubscription();
       runtimeStarted = false;
       startGate.hidden = false;
       failStartup(error);
@@ -106,6 +868,9 @@ var Module = (() => {
   }
 
   function failStartup(error) {
+    stopPhoneMotionSubscription();
+    runtimeStarted = false;
+    updateFullscreenUI();
     const message = error instanceof Error ? error.message : String(error);
     runtimeReady = false;
     gateTitle.textContent = "ROLLER could not start";
@@ -587,13 +1352,27 @@ var Module = (() => {
     });
   }
 
-  playButton.addEventListener("click", startRuntime);
+  playButton.addEventListener("click", () => void startRuntime());
   importButton.addEventListener("click", openCdImagePicker);
   reimportButton.addEventListener("click", openCdImagePicker);
   resetDemoButton.addEventListener("click", () => void resetToDemo());
   cdImageInput.addEventListener("change", () => void importCdImage(cdImageInput.files));
   continueImportButton.addEventListener("click", continueLargeImport);
   cancelImportButton.addEventListener("click", cancelLargeImport);
+  fullscreenButton.addEventListener("click", () => void toggleFullscreenFromGesture());
+  textDialogInput.addEventListener("input", filterTextDialogInput);
+  textDialog.addEventListener("submit", (event) => {
+    event.preventDefault();
+    completeTextDialog(true);
+  });
+  textDialogCancel.addEventListener("click", () => completeTextDialog(false));
+  textDialog.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      event.preventDefault();
+      completeTextDialog(false);
+    }
+  });
 
   // SDL's Emscripten keyboard target is #canvas. Keep it focused when mouse
   // input returns to the game or the browser tab/window becomes active again.
@@ -604,16 +1383,49 @@ var Module = (() => {
       focusCanvas();
     }
   });
-  canvas.addEventListener("contextmenu", (event) => {
+  gameFrame.addEventListener("contextmenu", (event) => {
     event.preventDefault();
   });
+  gameFrame.addEventListener("dragstart", (event) => {
+    event.preventDefault();
+  });
+  for (const eventName of ["gesturestart", "gesturechange", "gestureend"]) {
+    window.addEventListener(eventName, (event) => {
+      event.preventDefault();
+    }, { passive: false });
+  }
   window.addEventListener("focus", () => {
     if (runtimeStarted) {
       focusCanvas();
     }
   });
+  window.addEventListener("resize", () => {
+    if (!syntheticWindowResize)
+      scheduleVisualViewportLayout(false);
+  });
+  window.visualViewport?.addEventListener("resize", () => {
+    scheduleVisualViewportLayout(true);
+  });
+  window.visualViewport?.addEventListener("scroll", () => {
+    scheduleVisualViewportLayout(false);
+  });
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => {
+      if (activeFullscreenElement() !== gameFrame)
+        return;
+      if (canvas.width !== Math.round(canvas.clientWidth) ||
+          canvas.height !== Math.round(canvas.clientHeight)) {
+        syncFullscreenLayoutToSDL();
+      }
+    }).observe(canvas);
+  }
+  document.addEventListener("fullscreenchange", handleFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
   document.addEventListener("visibilitychange", () => {
-    if (runtimeStarted) {
+    if (document.hidden) {
+      stopPhoneMotionSubscription();
+    } else if (runtimeStarted) {
+      refreshPhoneMotionSubscription();
       focusCanvas();
     }
   });
@@ -624,17 +1436,48 @@ var Module = (() => {
     if (event.code === "Space" && event.target?.tagName === "BUTTON") {
       return;
     }
+    if (event.target?.tagName === "INPUT" || event.target?.tagName === "TEXTAREA") {
+      return;
+    }
     if (scrollKeys.has(event.key) || event.code === "Space") {
       event.preventDefault();
     }
   }, { passive: false });
 
+  applyVisualViewportLayout(false);
+
   return {
     canvas,
+    rollerPhoneMode: phoneModeDecision.active,
+    rollerPhoneModeSource: phoneModeDecision.source,
+    rollerPhoneTouchPoints: phoneModeDecision.touchPoints,
+    rollerPhoneCoarsePointer: phoneModeDecision.coarsePointer,
+    rollerMotionPermission: motionPermissionState,
+    rollerMotionListening: motionListening,
+    rollerMotionSampleReceived: motionSampleReceived,
+    rollerMotionFallback: false,
+    rollerMotionSecureContext: window.isSecureContext,
+    rollerMotionPolicy: readMotionPolicy(),
+    rollerMotionSensorPermissions: { ...motionSensorPermissions },
+    rollerMotionAccelerationSign: motionAccelerationSign,
+    rollerMotionDebug: motionDebug,
+    rollerVisualViewport: visualViewportState,
+    rollerFullscreenSupported: fullscreenSupported(),
+    rollerFullscreenActive: false,
+    rollerFullscreenLayout: null,
+    rollerOrientationLockSupported:
+      typeof window.screen?.orientation?.lock === "function",
+    rollerOrientationLockActive: false,
+    rollerTextDialogActive: false,
+    rollerTextDialogTarget: 0,
+    rollerShowTextDialog: showTextDialog,
     preRun: [preparePersistentFilesystem],
     setStatus,
     onRuntimeInitialized() {
       try {
+        applyPhoneMode();
+        updateMotionDiagnostics();
+        updateFullscreenUI();
         if (filesystemPreparationError) {
           throw filesystemPreparationError;
         }

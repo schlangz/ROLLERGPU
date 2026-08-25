@@ -106,6 +106,10 @@ void InputResetBindings(void);
 void InputApplyDefaultGamepadBindings(void);
 int InputLoadConfig(void);
 void InputSaveConfig(void);
+#if defined(IS_ANDROID)
+extern bool g_bForceLandscape;
+void InputSetForceLandscape(bool bForceLandscape);
+#endif
 #if defined(_WIN32)
 eInputWindowsBackend InputGetWindowsBackend(void);
 void InputLoadStartupConfig(void);
@@ -117,6 +121,11 @@ int InputPhoneAutoAccelerate(void);
 int InputPhoneBrakePressed(void);
 int InputGetPhoneSteeringValue(void);
 void InputGetPhoneControlDebugState(int *piLeft, int *piRight, int *piBrake);
+#if defined(IS_WASM)
+void InputPhoneSetWebAccel(float fX, float fY, float fZ);
+void InputPhoneSetWebControls(ePhoneControls eControls);
+int InputPhoneGetControls(void);
+#endif
 void InputGetBindingName(const tInputBinding *pBinding, char *szOut, int iOutLen);
 void InputGetActionBindingName(int iAction, char *szOut, int iOutLen);
 void InputSetKeyboardBinding(int iAction, int iScancode);
